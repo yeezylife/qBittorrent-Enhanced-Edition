@@ -142,7 +142,7 @@ namespace libtorrent
 namespace
 {
     const char PEER_ID[] = "qB";
-    const auto USER_AGENT = QStringLiteral("qBittorrent Enhanced/" QBT_VERSION_2);
+    const auto USER_AGENT = QStringLiteral("qBittorrent/" QBT_VERSION_2);
 
     void torrentQueuePositionUp(const lt::torrent_handle &handle)
     {
@@ -786,7 +786,7 @@ void SessionImpl::setPublicTrackers(const QString &trackers)
 void SessionImpl::updatePublicTracker()
 {
     Preferences *const pref = Preferences::instance();
-    Net::DownloadManager::instance()->download(Net::DownloadRequest(pref->customizeTrackersListUrl()).userAgent(QStringLiteral("qBittorrent Enhanced/" QBT_VERSION_2)), Preferences::instance()->useProxyForGeneralPurposes(), this, &SessionImpl::handlePublicTrackerTxtDownloadFinished);
+    Net::DownloadManager::instance()->download(Net::DownloadRequest(pref->customizeTrackersListUrl()).userAgent(QStringLiteral("qBittorrent/" QBT_VERSION_2)), Preferences::instance()->useProxyForGeneralPurposes(), this, &SessionImpl::handlePublicTrackerTxtDownloadFinished);
 }
 
 void SessionImpl::handlePublicTrackerTxtDownloadFinished(const Net::DownloadResult &result)
