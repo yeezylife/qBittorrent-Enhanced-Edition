@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        libt_version: ["2.1.0"]
+        libt_version: ["2.1.1"]
 
     env:
       boost_path: "${{ github.workspace }}/../boost"
