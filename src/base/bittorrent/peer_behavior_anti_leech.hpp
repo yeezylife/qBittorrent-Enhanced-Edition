@@ -664,7 +664,18 @@ private:
             else if ((parts[0] == QLatin1String("s24")) && ident.v4)
                 m_state->bannedSubnet24.insert(ident.subnet24);
             else if (parts[0] == QLatin1String("v6"))
-                m_state->bannedSubnet60.insert(ident.v6prefix);
+            {
+                // Guard against a malformed "v6 <ipv4>" line: classifying an
+                // IPv4 would leave v6prefix at 0 and ban all of IPv6.
+                if (!ident.v4)
+                {
+                    m_state->bannedSubnet60.insert(ident.v6prefix);
+                    // Re-seed the address-string cache so a restored /60 is kept
+                    // on the next shutdown (the cache is only populated by *new*
+                    // v6 bans at runtime, so we must restock it here).
+                    m_state->bannedV6Cache.push_back(parts[1].toStdString());
+                }
+            }
         }
     }
 
