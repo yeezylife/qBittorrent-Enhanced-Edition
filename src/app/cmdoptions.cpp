@@ -347,8 +347,6 @@ QBtCommandLineParameters::QBtCommandLineParameters(const QProcessEnvironment &en
     addTorrentParams.savePath = Path(SAVE_PATH_OPTION.value(env));
     addTorrentParams.category = CATEGORY_OPTION.value(env);
     addTorrentParams.skipChecking = SKIP_HASH_CHECK_OPTION.value(env);
-    addTorrentParams.sequential = SEQUENTIAL_OPTION.value(env);
-    addTorrentParams.firstLastPiecePriority = FIRST_AND_LAST_OPTION.value(env);
     addTorrentParams.addStopped = STOPPED_OPTION.value(env);
 }
 
