@@ -13,23 +13,26 @@
 // bad peer filter
 bool is_bad_peer(const lt::peer_info& info)
 {
-  static const std::regex id_filter("-(XL|SD|XF|QD|BN|DL|TS|DT|HP)(\\d+)-");
-  static const std::regex ua_filter(R"((\d+.\d+.\d+.\d+|cacao_torrent))");
-  static const std::regex consume_filter(R"(((dt|hp|xm)/torrent|Gopeed dev|Rain 0.0.0|(Taipei-torrent( dev)?)))", std::regex_constants::icase);
+  // 极强封禁名单: 国际通用，不再限定国家/地区（宁错杀不放过）。
+  static const std::regex id_filter("-(XL|SD|XF|QD|BN|DL|TS|DT|HP|XG|XX)(\\d+)-");
+  static const std::regex ua_filter(R"((cacao_torrent|Gotcha|gotcha\+torrent|torrentsearcher|web\.torrent))", std::regex_constants::icase);
+  // PCDN / 离线 / 吸血客户端通用签名（任何地区一律封禁）
+  static const std::regex consume_filter(R"(((dt|hp|xm|dl|x|sn)\/torrent|Gopeed dev|Rain 0\.0\.0|Taipei-torrent( dev)?|Xunlei|Thunder(( X)?|X)?|PCDN|cdndownload|cdn\-pcdn|magnetdl|emule))", std::regex_constants::icase);
   // Some PCDN/freeloading nodes pretend to be an old qBittorrent build (seen as seeders but barely upload).
 
-  // TODO: trafficConsume by thank243(senis) but it's hard to determine GT0003 is legitimate client or not...
-  // Anyway, block dt/torrent and Taipei-torrent with specific case first.
-  QString country = Net::GeoIPManager::instance()->lookup(QHostAddress(info.ip.data()));
-  if (country == QLatin1String("CN") && std::regex_match(info.client, consume_filter)) {
-      return true;
-  }
-
   // plain substring match: O(n), much cheaper than a std::regex_search
-  if (info.client.find("qBittorrent/4.6.7") != std::string::npos)
-      return true;
+  // 针对疑似 PCDN 伪装的多个旧版 qBittorrent 构建号
+  if (info.client.find("qBittorrent/4.6.7") != std::string::npos
+      || info.client.find("qBittorrent/4.6.8") != std::string::npos
+      || info.client.find("qBittorrent/4.5.4") != std::string::npos
+      || info.client.find("qBittorrent/4.5.5") != std::string::npos)
+    return true;
 
-  return std::regex_match(info.pid.data(), info.pid.data() + 8, id_filter) || std::regex_match(info.client, ua_filter);
+  // 吸血 / PCDN 签名 —— 全球封禁
+  if (std::regex_search(info.client, consume_filter))
+    return true;
+
+  return std::regex_search(info.client, ua_filter) || std::regex_match(info.pid.data(), info.pid.data() + 8, id_filter);
 }
 
 // Unknown Peer filter

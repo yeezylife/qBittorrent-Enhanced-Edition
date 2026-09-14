@@ -107,6 +107,7 @@
 #include "lttypecast.h"
 #include "nativesessionextension.h"
 #include "peer_blacklist.hpp"
+#include "peer_behavior_anti_leech.hpp"
 #include "peer_filter_session_plugin.hpp"
 #include "peer_shadowban_plugin.hpp"
 #include "portforwarderimpl.h"
@@ -1814,6 +1815,7 @@ void SessionImpl::initializeNativeSession()
     if (isAutoBanBTPlayerPeerEnabled())
         m_nativeSession->add_extension(&create_drop_bittorrent_media_player_plugin);
     m_nativeSession->add_extension(std::make_shared<peer_filter_session_plugin>());
+    m_nativeSession->add_extension(std::make_shared<peer_behavior_monitor>());
     if (isShadowBanEnabled())
         m_nativeSession->add_extension(&create_peer_shadowban_plugin);
 
