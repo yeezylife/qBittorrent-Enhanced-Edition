@@ -241,7 +241,6 @@ public:
             return; // I2P / non-IP connection, ignore
 
         registerMembership(ident);
-        updateMultiDial(ident);
 
         if (isBanned(ident))
         {
@@ -297,6 +296,11 @@ private:
         else
             ++m_state->subnetsV6[m_torrentId][ident.v6prefix][ident.v6id];
         m_registered = true;
+
+        // A subnet's membership only changes at connect/disconnect, so checking
+        // exactly once - right after incrementing - is equivalent to checking on
+        // every tick but costs one nested-map read instead of several per second.
+        updateMultiDial(ident);
     }
 
     // Multi-dial blocking: if too many distinct IPs of one subnet are attached
@@ -352,7 +356,16 @@ private:
 
         // PBH isUploadingToPeer: only judge a peer we are actually uploading to.
         const bool uploading = (info.total_upload > 0) || (info.up_speed > 0);
-        const double computedProgress = static_cast<double>(trk.statusUploaded) / static_cast<double>(m_torrentSize);
+
+        // Capture the previous non-zero report BEFORE overwriting it with this
+        // tick's value (PBH "finally" semantics): record every (non-zero)
+        // reported progress so the rewind check below can see a drop that a
+        // healthy peer never shows. Storing every tick is what lets rewind also
+        // catch a peer that resets to a low progress even when we have uploaded
+        // very little to it.
+        const float lastReported = trk.lastReportProgress;
+        if (progress != 0.0f)
+            trk.lastReportProgress = progress;
 
         // ---- (1) Excess download (PBH excessiveClient) -----------------------
         // Uses the cumulative upload count, and floors the allowed excess at
@@ -372,58 +385,56 @@ private:
         if (!uploading)          // PBH early pass: no uploads -> no progress judgement
             return;
 
-        // If the peer reports at least the progress we computed from uploads, it
-        // cannot be under-reporting; skip the progress checks (PBH).
-        if (computedProgress <= progress)
-        {
-            clearSuspicion(trk);
-            return;
-        }
-
-        const double difference = computedProgress - progress;
+        const double computedProgress = static_cast<double>(trk.statusUploaded) / static_cast<double>(m_torrentSize);
 
         // ---- (2) Under-reported progress (PBH differenceTest) ---------------
-        // Difference above the threshold persists for the confirmation window.
-        if (difference > kMaxProgressDiff)
+        // Only possible when our computed share exceeds the progress it reports.
+        // The confirmation window absorbs a brief transient (a fast peer's
+        // reported progress catching up to our upload count) while a sustained
+        // under-report eventually exceeds the window and is banned.
+        if (computedProgress > progress)
         {
-            if (confirmSuspicion(trk, now))
+            if ((computedProgress - progress) > kMaxProgressDiff)
+            {
+                if (confirmSuspicion(trk, now))
+                {
+                    clearSuspicion(trk);
+                    banExact(ident, "Progress fraud");
+                    return;
+                }
+            }
+            else
             {
                 clearSuspicion(trk);
-                banExact(ident, "Progress fraud");
-                return;
             }
         }
         else
         {
+            // Reported >= computed: as far as the difference is concerned the
+            // peer is advancing normally. A rewind that also trips below is
+            // judged independently on the next block.
             clearSuspicion(trk);
         }
 
         // ---- (3) Progress rewind (PBH progressRewind) ----------------------
-        // Peer previously reported a higher (non-zero) progress and now reports
-        // much less, i.e. it faked/reset. Unless the current progress is
-        // non-zero (peer already sent its bitfield), we wait out the window so a
-        // reconnecting seeder's brief 0% cannot false-ban it.
-        if (kRewindMaxDiff > 0.0f)
+        // Independent of the difference test so a peer that resets to a low
+        // progress - even with little uploaded on our side - is still flagged.
+        // progress>0 means it has already sent its (low) bitfield, i.e. the drop
+        // is a deliberate reset -> ban immediately. progress==0 (a reconnecting
+        // seeder before its bitfield) waits out the confirmation window instead.
+        if ((kRewindMaxDiff > 0.0f) && (lastReported >= 0.0f))
         {
-            const float lastReported = trk.lastReportProgress;
-            if (lastReported >= 0.0f)
+            const double rewind = static_cast<double>(lastReported) - progress;
+            if (rewind > kRewindMaxDiff)
             {
-                const double rewind = static_cast<double>(lastReported) - progress;
-                if (rewind > kRewindMaxDiff)
+                if ((progress > 0.0f) || confirmSuspicion(trk, now))
                 {
-                    if ((progress > 0.0f) || confirmSuspicion(trk, now))
-                    {
-                        clearSuspicion(trk);
-                        banExact(ident, "Progress rewind");
-                        return;
-                    }
+                    clearSuspicion(trk);
+                    banExact(ident, "Progress rewind");
+                    return;
                 }
             }
         }
-
-        // ---- Persist (PBH finally block) ------------------------------------
-        if (progress != 0.0f)          // never store a 0 report, avoid poisoning
-            trk.lastReportProgress = progress;
     }
 
     // PBH "ban-delay window": arm the confirmation timer on the first
