@@ -16,11 +16,18 @@ bool is_bad_peer(const lt::peer_info& info)
   static const std::regex id_filter("-(XL|SD|XF|QD|BN|DL|TS|DT|HP)(\\d+)-");
   static const std::regex ua_filter(R"((\d+.\d+.\d+.\d+|cacao_torrent))");
   static const std::regex consume_filter(R"(((dt|hp|xm)/torrent|Gopeed dev|Rain 0.0.0|(Taipei-torrent( dev)?)))", std::regex_constants::icase);
+  // Some PCDN/freeloading nodes pretend to be an old qBittorrent build (seen as seeders but barely upload).
+  static const std::regex fake_qbt_filter(R"(qBittorrent/4\.6\.7)", std::regex_constants::icase);
 
   // TODO: trafficConsume by thank243(senis) but it's hard to determine GT0003 is legitimate client or not...
   // Anyway, block dt/torrent and Taipei-torrent with specific case first.
   QString country = Net::GeoIPManager::instance()->lookup(QHostAddress(info.ip.data()));
   if (country == QLatin1String("CN") && std::regex_match(info.client, consume_filter)) {
+      return true;
+  }
+
+  // regex_search: info.client is the advertised UA string, may carry extra data
+  if (std::regex_search(info.client, fake_qbt_filter)) {
       return true;
   }
 
