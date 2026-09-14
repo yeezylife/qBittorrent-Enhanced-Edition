@@ -62,8 +62,13 @@
 #include <libtorrent/peer_info.hpp>
 #include <libtorrent/socket.hpp>
 
+#include <QFile>
+#include <QTextStream>
 #include <QString>
+#include <QStringList>
 
+#include "base/path.h"
+#include "base/profile.h"
 #include "base/logger.h"
 #include "peer_filter_plugin.hpp" // defines the `client_data` type alias
 
@@ -176,6 +181,15 @@ peer_identity classify_peer(const lt::address &addr)
     return out;
 }
 
+QString formatIPv4(std::uint32_t v)
+{
+    return QStringLiteral("%1.%2.%3.%4")
+        .arg(QString::number((v >> 24) & 0xFF))
+        .arg(QString::number((v >> 16) & 0xFF))
+        .arg(QString::number((v >> 8) & 0xFF))
+        .arg(QString::number(v & 0xFF));
+}
+
 // Per torrent + IP-group tracked facts (kept across reconnects so a cyclic
 // downloader cannot defeat us by disconnecting and reconnecting at 0%).
 struct peer_track
@@ -213,6 +227,11 @@ struct behavior_state
     std::unordered_set<std::uint32_t> bannedSubnet30;   // v4 /30 (auto range-ban)
     std::unordered_set<std::uint32_t> bannedSubnet24;   // v4 /24 (multi-dial)
     std::unordered_set<std::uint64_t> bannedSubnet60;   // v6 /60 (range + multi-dial)
+
+    // Canonical IPv6 strings of every banned /60 prefix, kept only so the ban
+    // cache can be serialised on shutdown (the numeric /60 key is derivable from
+    // the address but we never store the address itself in the sets above).
+    std::vector<std::string> bannedV6Cache;
 };
 
 // ---- peer plugin ------------------------------------------------
@@ -473,6 +492,8 @@ private:
         {
             newlyBanned = !m_state->bannedSubnet60.count(ident.v6prefix);
             m_state->bannedSubnet60.insert(ident.v6prefix);
+            if (newlyBanned)
+                m_state->bannedV6Cache.push_back(m_peer.remote().address().to_string());
         }
 
         if (newlyBanned)
@@ -518,6 +539,7 @@ private:
             return;
 
         m_state->bannedSubnet60.insert(prefix60);
+        m_state->bannedV6Cache.push_back(m_peer.remote().address().to_string());
 
         LogMsg(u"行为反吸血: 多拨封禁 整个 /%1 网段 (IP: %2)"_s
                    .arg(kSubnetV6)
@@ -573,10 +595,16 @@ public:
     peer_behavior_monitor()
         : m_state(std::make_shared<behavior_state>())
     {
+        loadBanCache();
     }
 
     ~peer_behavior_monitor() override
     {
+        // Runs from SessionImpl::~SessionImpl while the lt::session and its
+        // network threads are already being torn down (after pause() and resume
+        // data save), so a single synchronous disk write here is safe and sees
+        // the final ban state.
+        saveBanCache();
     }
 
     std::shared_ptr<lt::torrent_plugin> new_torrent(lt::torrent_handle const &th, client_data) override
@@ -590,6 +618,76 @@ public:
             return nullptr;
 
         return std::make_shared<peer_behavior_torrent_plugin>(m_state, m_nextId++, size);
+    }
+
+private:
+    // Ban persistence (read once at startup; written once at orderly shutdown).
+    // Plain text, one <kind> <ip> per line:
+    //   v4   203.0.113.5   (exact IPv4 host)
+    //   s30  203.0.113.4   (banned /30)
+    //   s24  203.0.113.0   (banned /24, multi-dial)
+    //   v6   2001:db8::1   (banned /60, range + multi-dial)
+    void loadBanCache()
+    {
+        const Path dir = specialFolderLocation(SpecialFolder::Data);
+        if (dir.isEmpty())
+            return;
+
+        const Path file = dir / Path(QStringLiteral("behavior_ban_cache.txt"));
+        QFile in(file.toString());
+        if (!in.open(QIODevice::ReadOnly))
+            return;
+
+        QTextStream ts(&in);
+        while (!ts.atEnd())
+        {
+            const QStringList parts = ts.readLine().split(QLatin1Char(' '));
+            if ((parts.size() < 2) || parts[1].isEmpty())
+                continue;
+
+            peer_identity ident;
+            try
+            {
+                ident = classify_peer(lt::make_address(parts[1].toStdString()));
+                if (!ident.ok)
+                    continue;
+            }
+            catch (const std::exception &)
+            {
+                continue;
+            }
+
+            if ((parts[0] == QLatin1String("v4")) && ident.v4)
+                m_state->bannedExact.insert(ident.host);
+            else if ((parts[0] == QLatin1String("s30")) && ident.v4)
+                m_state->bannedSubnet30.insert(ident.subnet30);
+            else if ((parts[0] == QLatin1String("s24")) && ident.v4)
+                m_state->bannedSubnet24.insert(ident.subnet24);
+            else if (parts[0] == QLatin1String("v6"))
+                m_state->bannedSubnet60.insert(ident.v6prefix);
+        }
+    }
+
+    void saveBanCache()
+    {
+        const Path dir = specialFolderLocation(SpecialFolder::Data);
+        if (dir.isEmpty())
+            return;
+
+        const Path file = dir / Path(QStringLiteral("behavior_ban_cache.txt"));
+        QFile out(file.toString());
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            return;
+
+        QTextStream ts(&out);
+        for (const std::uint64_t host : m_state->bannedExact)
+            ts << QStringLiteral("v4 ") << formatIPv4(static_cast<std::uint32_t>(host & 0xFFFFFFFFu)) << '\n';
+        for (const std::uint32_t subnet : m_state->bannedSubnet30)
+            ts << QStringLiteral("s30 ") << formatIPv4(subnet) << '\n';
+        for (const std::uint32_t subnet : m_state->bannedSubnet24)
+            ts << QStringLiteral("s24 ") << formatIPv4(subnet) << '\n';
+        for (const std::string &addr : m_state->bannedV6Cache)
+            ts << QStringLiteral("v6 ") << QString::fromStdString(addr) << '\n';
     }
 
 private:
