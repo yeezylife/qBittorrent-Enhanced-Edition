@@ -1,20 +1,28 @@
 #pragma once
 
-// Behavioral anti-leech engine (PeerBanHelper-style).
+// Behavioral anti-leech engine, logic aligned to PBH-BTN/PeerBanHelper's
+// ProgressCheatBlocker, MultiDialingBlocker and AutoRangeBan modules.
 //
 // Implements three closely related detection modules that operate on sampling
 // each connection's actual transfer counters rather than on client signatures:
 //
 //   1. 进度检查器 / Progress-Cheat Blocker (PCB)
-//       - under-reported progress : we know how many bytes we uploaded to a
-//         peer (peer_info::total_upload). That sets a *minimum* download each
-//         peer must genuinely have. If the peer reports a progress much lower
-//         than that minimum, it is lying about its progress -> ban.
-//       - progress rewind / reset : we remember the highest progress each
-//         IP-group ever reported. If a (re)connecting peer reports progress
-//         that dropped more than the allowed rewind, it faked progress -> ban.
-//       - excess download : if we uploaded to one peer more than the whole
-//         torrent (x threshold), the peer is a cyclic downloader -> ban.
+//       - under-reported progress / difference : we accumulate how many bytes we
+//         uploaded to an IP-group across reconnects (PBH "tracking uploaded
+//         increase total"). That cumulative count sets a *minimum* the peer must
+//         genuinely have downloaded. If it reports noticeably less, it is lying
+//         -> ban (PBH differenceTest).
+//       - progress rewind : the highest non-zero progress an IP-group ever
+//         reported vs. what it reports now. Dropping more than allowed means it
+//         reset/faked its progress -> ban (PBH progressRewind).
+//       - excess download : cumulative uploads exceeding the torrent size
+//         (floored at the minimum torrent size) x threshold -> ban (PBH
+//         excessiveClient).
+//       - every progress-based suspicion must persist for a short confirmation
+//         window (PBH "max-wait-duration" / ban-delay window) before it is acted
+//         on, and a 0% report is never trusted or stored. This is what makes a
+//         reconnecting seeder (brief 0% until its bitfield arrives) safe from
+//         false bans while cheating low-reporting peers are still caught.
 //   2. 多拨封禁 / Multi-dial blocker
 //       - counts *distinct* IPs inside one subnet that are connected to the
 //         same torrent. Beyond a tolerance it is treated as one user hogging
@@ -37,6 +45,8 @@
 // ("宁错杀不放过"): tune them down if you get too many false positives.
 
 #include <array>
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -68,32 +78,24 @@ namespace
 // torrents leave peers no chance to sync genuine progress, causing false bans.
 constexpr std::int64_t kMinTorrentSizeBytes = 20 * 1024 * 1024;
 
-// Require us to have uploaded at least this fraction of the torrent to a peer
-// before trusting our view of its minimum download. Avoids flagging brand new
-// barely-connected peers.
-constexpr float kProgressFraudMinUpload = 0.05f;
-
-// If peer reports a progress that is more than this much *below* the fraction
-// we actually uploaded to it, it is reporting fake progress.
+// PBH "maximum-difference": if the fraction of the torrent we actually uploaded
+// to a peer exceeds the progress it reports by more than this, it is under-
+// reporting. (PBH compares expected=computedUploaded/size vs reported.)
 constexpr float kMaxProgressDiff = 0.02f;
 
-// Allowed progress rewind between connections (fraction). Pity epsilon for
-// legitimately-corrupted / re-downloaded pieces.
+// PBH "rewind-maximum-difference": how much progress a peer may drop between
+// reports before we consider it to have faked progress (reconnect reset).
 constexpr float kRewindMaxDiff = 0.02f;
 
-// Only treat a progress drop as rewind cheating if the peer previously claimed
-// at least this much progress. Small progress can wobble harmlessly.
-constexpr float kRewindMinMaxProgress = 0.20f;
+// PBH "max-wait-duration" (ms): the confirmation window. A progress-based
+// suspicion is only acted on once it persists for at least this long, so a
+// brief transient (e.g. a reconnecting seeder reporting 0 until its bitfield
+// arrives) never triggers a false ban.
+constexpr std::int64_t kBanConfirmDelayMs = 1500;
 
-// How many seconds a connection must have survived (and completed its
-// handshake) before its reported progress is trusted for the progress-based
-// detections. Without this grace period a reconnecting seeder that briefly
-// reports 0% until its bitfield arrives would be false-banned. Leechers that
-// fake a low progress remain low and are caught after this grace period.
-constexpr int kStabilizeTicks = 3;
-
-// Ban peers whose cumulative download from us exceeds torrent size * factor.
+// Ban peers whose cumulative download from us exceeds this threshold.
 constexpr bool kBlockExcessive = true;
+// PBH floors the allowed excess at max(torrentSize, torrentMinimumSize).
 constexpr float kExcessiveThreshold = 1.1f;
 
 // Multi-dial subnet prefixes.
@@ -118,6 +120,14 @@ std::uint64_t fnv1a64(const unsigned char *p, std::size_t n)
         h *= kFNV1aPrime;
     }
     return h;
+}
+
+// Steady monotonic clock in milliseconds. Only used for the confirmation
+// window (no wall-time / timezone handling needed).
+std::int64_t nowMs()
+{
+    using namespace std::chrono;
+    return time_point_cast<milliseconds>(steady_clock::now()).time_since_epoch().count();
 }
 
 // Per-IP address classification. v4 uses a plain 32-bit host; v6 uses a 60-bit
@@ -166,12 +176,24 @@ peer_identity classify_peer(const lt::address &addr)
     return out;
 }
 
-// Per torrent + IP-group tracked facts (kept across reconnects to survive the
-// "cache-forgetting" trick).
+// Per torrent + IP-group tracked facts (kept across reconnects so a cyclic
+// downloader cannot defeat us by disconnecting and reconnecting at 0%).
 struct peer_track
 {
-    std::int64_t maxUpload = 0;   // most bytes we have ever uploaded to this group
-    float maxProgress = -1.0f;    // highest progress this group ever claimed
+    // Cumulative bytes we have ever (admittedly) uploaded to this group of IPs
+    // for this torrent, summed across connections. This is PBH's "tracking
+    // uploaded increase total": it makes the excess/progress checks immune to
+    // per-connection counter resets.
+    std::int64_t statusUploaded = 0;
+
+    // Last *non-zero* progress this group reported. PBH never stores 0.0 so a
+    // reconnecting seeder's transient 0% cannot poison the record and trigger a
+    // false rewind ban on the next reconnect.
+    float lastReportProgress = -1.0f;
+
+    // Steady-clock millisecond timestamp when the last progress-based suspicion
+    // was first observed (PBH "ban-delay window"). 0 = no active suspicion.
+    std::int64_t suspectSinceMs = 0;
 };
 
 // Shared, cross-torrent anti-leech state. Only ever modified by plugin
@@ -210,8 +232,6 @@ public:
     {
         if (m_state && !m_attached)
             return;
-
-        ++m_ticks;
 
         lt::peer_info info;
         m_peer.get_peer_info(info);
@@ -311,59 +331,117 @@ private:
         if (m_torrentSize < kMinTorrentSizeBytes)
             return;
 
-        // Progress is not trustworthy while the peer is still handshaking, or for
-        // the first few seconds of a connection (a reconnecting seeder can report
-        // 0% until it sends its bitfield). Jumping to bans then would nuke
-        // legitimate peers. Leechers that fake a low progress stay low and are
-        // caught once the connection stabilises.
-        if ((info.flags & lt::peer_info::handshake) || (m_ticks < kStabilizeTicks))
+        // PBH hands peers still in the handshake the "handshaking" pass; their
+        // reported progress (0) is not yet trustworthy.
+        if (info.flags & lt::peer_info::handshake)
             return;
 
-        float progress = info.progress;
-        if (progress < 0.0f)
-            progress = 0.0f;
-        if (progress > 1.0f)
-            progress = 1.0f;
-
+        const std::int64_t now = nowMs();
+        const float progress = std::clamp(info.progress, 0.0f, 1.0f);
         peer_track &trk = m_state->track[m_torrentId][ident.groupKey()];
 
-        // (1) Excess download : uploaded to a single peer more than a whole torrent.
-        if (kBlockExcessive
-                && (info.total_upload > static_cast<std::int64_t>(static_cast<double>(m_torrentSize) * kExcessiveThreshold)))
+        // ---- Cumulative upload tracking (PBH "总上传量/增量") -----------------
+        // Survives per-connection counter resets, so a cyclic downloader cannot
+        // defeat the checks by disconnecting/reconnecting at 0%.
+        const std::int64_t cur = info.total_upload;
+        trk.statusUploaded += m_hasPrevTotal
+            ? ((cur >= m_lastUpload) ? (cur - m_lastUpload) : cur)  // reset -> whole value is fresh
+            : cur;                                                  // first observation of this connection
+        m_lastUpload = cur;
+        m_hasPrevTotal = true;
+
+        // PBH isUploadingToPeer: only judge a peer we are actually uploading to.
+        const bool uploading = (info.total_upload > 0) || (info.up_speed > 0);
+        const double computedProgress = static_cast<double>(trk.statusUploaded) / static_cast<double>(m_torrentSize);
+
+        // ---- (1) Excess download (PBH excessiveClient) -----------------------
+        // Uses the cumulative upload count, and floors the allowed excess at
+        // max(torrentSize, minimumSize) exactly like PBH.
+        if (kBlockExcessive && (trk.statusUploaded > m_torrentSize))
         {
-            banExact(ident, "Excess download");
+            const std::int64_t allowed = static_cast<std::int64_t>(
+                static_cast<double>(std::max(m_torrentSize, kMinTorrentSizeBytes)) * kExcessiveThreshold);
+            if (trk.statusUploaded > allowed)
+            {
+                clearSuspicion(trk);
+                banExact(ident, "Excess download");
+                return;
+            }
+        }
+
+        if (!uploading)          // PBH early pass: no uploads -> no progress judgement
+            return;
+
+        // If the peer reports at least the progress we computed from uploads, it
+        // cannot be under-reporting; skip the progress checks (PBH).
+        if (computedProgress <= progress)
+        {
+            clearSuspicion(trk);
             return;
         }
 
-        // (2) Under-reported progress : the share of the torrent we uploaded sets the
-        //     minimum it must have downloaded; reporting far less is cheating.
-        const double uploadFrac = static_cast<double>(info.total_upload) / static_cast<double>(m_torrentSize);
-        if ((uploadFrac >= static_cast<double>(kProgressFraudMinUpload))
-                && ((static_cast<float>(uploadFrac) - progress) > kMaxProgressDiff))
+        const double difference = computedProgress - progress;
+
+        // ---- (2) Under-reported progress (PBH differenceTest) ---------------
+        // Difference above the threshold persists for the confirmation window.
+        if (difference > kMaxProgressDiff)
         {
-            banExact(ident, "Progress fraud");
-            return;
+            if (confirmSuspicion(trk, now))
+            {
+                clearSuspicion(trk);
+                banExact(ident, "Progress fraud");
+                return;
+            }
+        }
+        else
+        {
+            clearSuspicion(trk);
         }
 
-        // (3) Progress rewind : a (re)connecting peer that previously claimed a
-        //     large progress and now reports much less faked its numbers.
-        if ((trk.maxProgress >= kRewindMinMaxProgress)
-                && (progress >= 0.0f)
-                && (trk.maxProgress - progress) > kRewindMaxDiff)
+        // ---- (3) Progress rewind (PBH progressRewind) ----------------------
+        // Peer previously reported a higher (non-zero) progress and now reports
+        // much less, i.e. it faked/reset. Unless the current progress is
+        // non-zero (peer already sent its bitfield), we wait out the window so a
+        // reconnecting seeder's brief 0% cannot false-ban it.
+        if (kRewindMaxDiff > 0.0f)
         {
-            banExact(ident, "Progress rewind");
-            return;
+            const float lastReported = trk.lastReportProgress;
+            if (lastReported >= 0.0f)
+            {
+                const double rewind = static_cast<double>(lastReported) - progress;
+                if (rewind > kRewindMaxDiff)
+                {
+                    if ((progress > 0.0f) || confirmSuspicion(trk, now))
+                    {
+                        clearSuspicion(trk);
+                        banExact(ident, "Progress rewind");
+                        return;
+                    }
+                }
+            }
         }
 
-        // Update the persistent record.
-        if (info.total_upload > trk.maxUpload)
-            trk.maxUpload = info.total_upload;
-        if (progress > trk.maxProgress)
+        // ---- Persist (PBH finally block) ------------------------------------
+        if (progress != 0.0f)          // never store a 0 report, avoid poisoning
+            trk.lastReportProgress = progress;
+    }
+
+    // PBH "ban-delay window": arm the confirmation timer on the first
+    // observation of a suspicion; return true (ban) only once it has persisted
+    // for at least kBanConfirmDelayMs. A transient clears the timer instead.
+    bool confirmSuspicion(peer_track &trk, std::int64_t now)
+    {
+        if (trk.suspectSinceMs == 0)
         {
-            trk.maxProgress = progress;
-            if (trk.maxProgress > 1.0f)
-                trk.maxProgress = 1.0f;
+            trk.suspectSinceMs = now;
+            return false;
         }
+        return (now - trk.suspectSinceMs) >= kBanConfirmDelayMs;
+    }
+
+    void clearSuspicion(peer_track &trk)
+    {
+        trk.suspectSinceMs = 0;
     }
 
     void banExact(const peer_identity &ident, const char *reason)
@@ -448,7 +526,8 @@ private:
     const std::int64_t m_torrentSize;
     lt::peer_connection_handle m_peer;
     peer_identity m_identity;
-    int m_ticks = 0;
+    std::int64_t m_lastUpload = 0;   // last observed total_upload on this connection
+    bool m_hasPrevTotal = false;     // whether m_lastUpload is meaningful yet
     bool m_registered = false;
     bool m_attached = true;
 };
