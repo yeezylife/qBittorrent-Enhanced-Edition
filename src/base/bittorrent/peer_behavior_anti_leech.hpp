@@ -298,6 +298,7 @@ struct trie_node
 class subnet_trie
 {
 public:
+    subnet_trie() = default;
     subnet_trie(const subnet_trie &) = delete;
     subnet_trie &operator=(const subnet_trie &) = delete;
 
