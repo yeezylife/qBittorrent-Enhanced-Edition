@@ -54,6 +54,9 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include <atomic>
+#include <memory>
+
 #include <boost/asio/error.hpp>
 
 #include <libtorrent/address.hpp>
@@ -64,17 +67,12 @@
 
 #include <QByteArray>
 #include <QFile>
-#include <QEventLoop>
-#include <QNetworkAccessManager>
-#include <QNetworkReply>
-#include <QNetworkRequest>
 #include <QObject>
 #include <QTextStream>
 #include <QString>
 #include <QStringList>
-#include <QTimer>
-#include <QUrl>
 
+#include "base/net/downloadmanager.h"
 #include "base/path.h"
 #include "base/profile.h"
 #include "base/logger.h"
@@ -121,6 +119,12 @@ constexpr int kTolerateV6 = 2;
 
 constexpr std::uint64_t kFNV1aOffset = 14695981039346656037ULL;
 constexpr std::uint64_t kFNV1aPrime = 1099511628211ULL;
+
+// Minimum number of parsed rules below which a freshly downloaded subscription
+// body is assumed malformed/truncated (e.g. a rate-limit or captive page) and is
+// discarded so the last known-good cache is kept. The live list normally carries
+// ~700 rules, so a healthy body always clears this comfortably.
+constexpr std::size_t kMinSubscriptionRules = 50;
 
 // FNV-1a 64-bit one-way hash. Used *only* to tell distinct IPv6 addresses
 // apart for counting; not used as a ban identity.
@@ -234,23 +238,98 @@ void maskV6(v6bytes_t &b, int prefix)
         b[full] = static_cast<unsigned char>(b[full] & static_cast<unsigned char>(0xFFu << (8 - rem)));
 }
 
-bool v6Contains(const v6bytes_t &peer, const v6bytes_t &net, int prefix)
+// Stretch an IPv4 host (b[0] is the most-significant octet, as produced by
+// classify_peer) into the 128-bit byte container used by the trie. Only the
+// first 4 bytes are meaningful; the high bits of a v4 rule are never walked.
+v6bytes_t v4HostToBytes(std::uint32_t host)
 {
-    const int full = prefix / 8;
-    const int rem = prefix % 8;
-    for (int i = 0; i < full; ++i)
-    {
-        if (peer[i] != net[i])
-            return false;
-    }
-    if (rem)
-    {
-        const unsigned char m = static_cast<unsigned char>(0xFFu << (8 - rem));
-        if ((peer[full] & m) != (net[full] & m))
-            return false;
-    }
-    return true;
+    v6bytes_t b {};
+    b[0] = static_cast<unsigned char>(host >> 24);
+    b[1] = static_cast<unsigned char>(host >> 16);
+    b[2] = static_cast<unsigned char>(host >> 8);
+    b[3] = static_cast<unsigned char>(host);
+    return b;
 }
+
+// One node of the binary prefix trie. `banned` marks the end of an inserted
+// rule (its network bits up to that node are the CIDR).
+struct trie_node
+{
+    bool banned = false;
+    trie_node *child[2] = {nullptr, nullptr};
+};
+
+// Binary prefix trie: CIDR containment in O(prefix bits), independent of the
+// number of rules. A rule is stored by walking only its `prefix` leading bits;
+// a query walks the peer address bits and reports a hit when any node on the
+// path is a rule terminal. Owns its nodes and frees them recursively on
+// destruction (an old snapshot's trie is reclaimed when a refresh replaces it).
+class subnet_trie
+{
+public:
+    subnet_trie() = default;
+    subnet_trie(const subnet_trie &) = delete;
+    subnet_trie &operator=(const subnet_trie &) = delete;
+    ~subnet_trie()
+    {
+        deleteNode(m_root.child[0]);
+        deleteNode(m_root.child[1]);
+    }
+
+    // Insert one CIDR. Only the first `prefix` bits of net are consumed; the
+    // masked trailing bits (already zero in s4.net/s6.net) are irrelevant.
+    void insert(const v6bytes_t &net, int prefix)
+    {
+        trie_node *n = &m_root;
+        for (int bit = 0; bit < prefix; ++bit)
+        {
+            const int b = (net[static_cast<unsigned>(bit) >> 3] >> (7 - (bit & 7))) & 1;
+            if (!n->child[b])
+                n->child[b] = new trie_node;
+            n = n->child[b];
+        }
+        n->banned = true;
+    }
+
+    // true if `addr` is contained by any inserted rule. Walks at most the
+    // deepest rule prefix (<=128 bits), never the rule count.
+    bool contains(const v6bytes_t &addr) const
+    {
+        const trie_node *n = &m_root;
+        for (int bit = 0; bit < 128 && n; ++bit)
+        {
+            if (n->banned)
+                return true;   // a higher-level prefix already covers addr
+            const int b = (addr[static_cast<unsigned>(bit) >> 3] >> (7 - (bit & 7))) & 1;
+            n = n->child[b];
+        }
+        return n && n->banned;
+    }
+
+private:
+    static void deleteNode(trie_node *n)
+    {
+        if (!n)
+            return;
+        deleteNode(n->child[0]);
+        deleteNode(n->child[1]);
+        delete n;
+    }
+    trie_node m_root;
+};
+
+// An immutable snapshot of the subscribed CIDR rules (one trie per family plus
+// their persistence mirrors). It is built in full on the refresh thread and
+// swapped into the state as a whole, so the network thread always reads either
+// the previous snapshot or the new one - never a half-parsed mix. All fields are
+// const-free by convention and only mutated before the snapshot is published.
+struct subscription_data
+{
+    subnet_trie trieV4;
+    subnet_trie trieV6;
+    std::vector<subnet_v4> v4;   // persistence mirror (c4 cache lines)
+    std::vector<subnet_v6> v6;   // persistence mirror (c6 cache lines)
+};
 
 // Parse one BCR line into a v4 or v6 CIDR. Returns 1 = v4 filled, 2 = v6
 // filled, 0 = unparseable (caller should skip the line).
@@ -349,12 +428,16 @@ struct behavior_state
     std::vector<std::string> bannedV6Cache;
 
     // Network IP-set rules (subscribed CIDRs, e.g. PBH-BTN/BTN-Collected-Rules).
-    // Filled at startup by fetchSubscription(); a fresh download replaces the
-    // whole list. Peers whose address falls inside any range are banned. Only
-    // ever written on the app thread before peers attach, read on the network
-    // thread thereafter (no writes after startup => no data race).
-    std::vector<subnet_v4> subV4;
-    std::vector<subnet_v6> subV6;
+    // The default (empty) snapshot is populated from the local cache at startup,
+    // then the background refresh swaps in a fresh snapshot on success. Peers
+    // whose address falls inside any range are banned.
+    // Thread safety (lock-free via atomic shared_ptr): the Net download callback
+    // runs on a worker thread and stores a brand-new snapshot; the libtorrent
+    // thread concurrently loads it in isBanned. A release store republishes the
+    // fully-parsed snapshot and an acquire load reads a consistent one; the
+    // loaded shared_ptr keeps the snapshot alive while isBanned walks its trie,
+    // so a replace that drops the last other reference frees it only afterwards.
+    std::atomic<std::shared_ptr<subscription_data>> subscription = std::make_shared<subscription_data>();
 };
 
 // ---- peer plugin ------------------------------------------------
@@ -471,17 +554,13 @@ private:
                     || m_state->bannedSubnet30.count(ident.subnet30)
                     || m_state->bannedSubnet24.count(ident.subnet24))
                 return true;
-            for (const subnet_v4 &s : m_state->subV4)
-                if ((ident.host & s.mask) == s.net)
-                    return true;
-            return false;
+            const std::shared_ptr<subscription_data> sub = m_state->subscription.load(std::memory_order_acquire);
+            return sub->trieV4.contains(v4HostToBytes(ident.host));
         }
         if (m_state->bannedSubnet60.count(ident.v6prefix))
             return true;
-        for (const subnet_v6 &s : m_state->subV6)
-            if (v6Contains(ident.v6bytes, s.net, s.prefix))
-                return true;
-        return false;
+        const std::shared_ptr<subscription_data> sub = m_state->subscription.load(std::memory_order_acquire);
+        return sub->trieV6.contains(ident.v6bytes);
     }
 
     void runDetections(const lt::peer_info &info, const peer_identity &ident)
@@ -778,6 +857,12 @@ private:
             return;
 
         QTextStream ts(&in);
+
+        // This runs in the constructor, before the torrent/network thread
+        // exists and before the background refresh can store anything, so it
+        // is safe to mutate the single (shared) default snapshot directly. The
+        // refresh later replaces it wholesale via an atomic store.
+        const std::shared_ptr<subscription_data> sub = m_state->subscription.load();
         while (!ts.atEnd())
         {
             const QStringList parts = ts.readLine().split(QLatin1Char(' '));
@@ -820,14 +905,20 @@ private:
                 subnet_v4 s4;
                 subnet_v6 s6;
                 if (parseCIDR(parts[1], s4, s6) == 1)
-                    m_state->subV4.push_back(s4);
+                {
+                    sub->v4.push_back(s4);
+                    sub->trieV4.insert(v4HostToBytes(s4.net), s4.prefix);
+                }
             }
             else if (parts[0] == QLatin1String("c6"))
             {
                 subnet_v4 s4;
                 subnet_v6 s6;
                 if (parseCIDR(parts[1], s4, s6) == 2)
-                    m_state->subV6.push_back(s6);
+                {
+                    sub->v6.push_back(s6);
+                    sub->trieV6.insert(s6.net, s6.prefix);
+                }
             }
         }
     }
@@ -852,65 +943,75 @@ private:
             ts << QStringLiteral("s24 ") << formatIPv4(subnet) << '\n';
         for (const std::string &addr : m_state->bannedV6Cache)
             ts << QStringLiteral("v6 ") << QString::fromStdString(addr) << '\n';
-        for (const subnet_v4 &s : m_state->subV4)
+
+        const std::shared_ptr<subscription_data> sub = m_state->subscription.load(std::memory_order_acquire);
+        for (const subnet_v4 &s : sub->v4)
             ts << QStringLiteral("c4 ") << formatIPv4(s.net) << QLatin1Char('/') << s.prefix << '\n';
-        for (const subnet_v6 &s : m_state->subV6)
+        for (const subnet_v6 &s : sub->v6)
             ts << QStringLiteral("c6 ") << QString::fromStdString(lt::address_v6(s.net).to_string())
                << QLatin1Char('/') << static_cast<int>(s.prefix) << '\n';
     }
 
-    // Pull the network IP-set rules from the remote source (PBH-BTN/BCR
-    // combined rule list). Only ever runs once at startup on the app thread
-    // before any peer plugin is created, so the lists are fully populated
-    // before the network thread starts reading them (no data race). The fetch
-    // fails soft: on any network/parse error we keep the cached subscription
-    // already loaded by loadBanCache().
+    // Kick off an asynchronous fetch of the network IP-set rules (PBH-BTN/BCR
+    // combined list) through the app-wide Net::DownloadManager (handles proxy,
+    // SSL, timeouts - the same path the app uses for tracker/rules updates).
+    // Returns immediately so startup is never blocked; until a successful
+    // refresh the snapshot loaded from cache by loadBanCache() stays in effect.
+    // The finished callback is anchored to m_ctx (auto-disconnected if this
+    // monitor is torn down while a download is still in flight) and captures
+    // m_state by value, so the shared state is kept alive regardless of this
+    // monitor's lifetime. It parses into a fresh snapshot, applies the
+    // empty-result guard, and only then publishes it via an atomic release
+    // store that the libtorrent thread reads with an acquire load.
     void fetchSubscription()
     {
-        QNetworkAccessManager nam;
-        QNetworkRequest request(QUrl(QStringLiteral("https://bcr.pbh-btn.com/combine/all.txt")));
-        request.setTransferTimeout(10000);
+        Net::DownloadManager *const mgr = Net::DownloadManager::instance();
+        if (!mgr)
+            return;
 
-        QNetworkReply *reply = nam.get(request);
-        QEventLoop loop;
-        QTimer watchdog;
-        watchdog.setSingleShot(true);
-        bool finished = false;
-        QObject::connect(&watchdog, &QTimer::timeout, &loop, &QEventLoop::quit);
-        QObject::connect(reply, &QNetworkReply::finished, &loop, [&finished, &loop]() {
-            finished = true;
-            loop.quit();
-        });
-        watchdog.start(10000);
-        loop.exec(); // nested event loop; drives the network + timer on this thread
-        watchdog.stop();
+        const std::shared_ptr<behavior_state> state = m_state;
+        Net::DownloadHandler *const handler = mgr->download(
+            Net::DownloadRequest(QStringLiteral("https://bcr.pbh-btn.com/combine/all.txt"))
+                .limit(4 * 1024 * 1024),
+            false);
+        QObject::connect(handler, &Net::DownloadHandler::finished, &m_ctx,
+            [state](const Net::DownloadResult &res) {
+                if (res.status != Net::DownloadStatus::Success)
+                {
+                    LogMsg(QStringLiteral("BehaviorAntiLeech: subscription fetch failed (%1), keeping cached rules")
+                               .arg(res.errorString));
+                    return;
+                }
 
-        if (finished && (reply->error() == QNetworkReply::NoError))
-        {
-            applySubscriptionBody(reply->readAll());
-            LogMsg(QStringLiteral("BehaviorAntiLeech: loaded %1 v4 and %2 v6 network rules from subscription")
-                       .arg(m_state->subV4.size()).arg(m_state->subV6.size()));
-        }
-        else
-        {
-            LogMsg(QStringLiteral("BehaviorAntiLeech: subscription fetch failed (timeout/error), keeping cached rules"));
-        }
+                auto fresh = std::make_shared<subscription_data>();
+                const std::size_t parsed = parseSubscriptionBody(res.data, *fresh);
 
-        reply->deleteLater();
+                if (parsed >= kMinSubscriptionRules)
+                {
+                    state->subscription.store(fresh, std::memory_order_release);
+                    LogMsg(QStringLiteral("BehaviorAntiLeech: subscription refresh applied (%1 v4, %2 v6 CIDRs)")
+                               .arg(fresh->v4.size()).arg(fresh->v6.size()));
+                }
+                else
+                {
+                    // Malformed/truncated body (e.g. a rate-limit or captive
+                    // page): keep the last known-good cache.
+                    LogMsg(QStringLiteral("BehaviorAntiLeech: subscription refresh rejected (%1 rules < %2), keeping cached rules")
+                               .arg(parsed).arg(kMinSubscriptionRules));
+                }
+            });
     }
 
-    void applySubscriptionBody(const QByteArray &body)
+    // Parse a downloaded subscription body into `out`. Returns the number of
+    // CIDRs successfully parsed; the empty-result guard lives in
+    // fetchSubscription. Parses into a throwaway snapshot rather than the live
+    // state, so a rejected body never disturbs the published snapshot.
+    static std::size_t parseSubscriptionBody(const QByteArray &body, subscription_data &out)
     {
-        // A fresh download replaces the whole subscription (cache-only rules
-        // are discarded; they are refreshed on shutdown).
-        m_state->subV4.clear();
-        m_state->subV6.clear();
-
         QString text = QString::fromUtf8(body);
         text.remove(QChar(0xFEFF)); // strip any UTF-8 BOM
         const QStringList lines = text.split(QLatin1Char('\n'));
-        int v4 = 0;
-        int v6 = 0;
+        std::size_t parsed = 0;
         for (QString line : lines)
         {
             line = line.trimmed();
@@ -921,21 +1022,31 @@ private:
             const int kind = parseCIDR(line, s4, s6);
             if (kind == 1)
             {
-                m_state->subV4.push_back(s4);
-                ++v4;
+                out.v4.push_back(s4);
+                out.trieV4.insert(v4HostToBytes(s4.net), s4.prefix);
+                ++parsed;
             }
             else if (kind == 2)
             {
-                m_state->subV6.push_back(s6);
-                ++v6;
+                out.v6.push_back(s6);
+                out.trieV6.insert(s6.net, s6.prefix);
+                ++parsed;
             }
         }
-        LogMsg(QStringLiteral("BehaviorAntiLeech: rules refresh applied (%1 v4, %2 v6 CIDRs)").arg(v4).arg(v6));
+        return parsed;
     }
 
 private:
     std::shared_ptr<behavior_state> m_state;
     std::uint32_t m_nextId = 0;
+
+    // Context/anchor for the Net::DownloadManager callback. It is not a QObject
+    // itself (the plugin derives from lt::plugin), so this member gives the
+    // connect() a QObject context: the slot runs on the main thread and is
+    // auto-disconnected when this monitor is destroyed, and it is torn down
+    // before m_state in the destructor order. qBittorrent compiles with
+    // QT_NO_CONTEXTLESS_CONNECT, so a context is mandatory.
+    QObject m_ctx;
 };
 
 } // namespace
