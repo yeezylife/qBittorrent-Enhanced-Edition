@@ -62,10 +62,18 @@
 #include <libtorrent/peer_info.hpp>
 #include <libtorrent/socket.hpp>
 
+#include <QByteArray>
 #include <QFile>
+#include <QEventLoop>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QObject>
 #include <QTextStream>
 #include <QString>
 #include <QStringList>
+#include <QTimer>
+#include <QUrl>
 
 #include "base/path.h"
 #include "base/profile.h"
@@ -135,6 +143,9 @@ std::int64_t nowMs()
     return time_point_cast<milliseconds>(steady_clock::now()).time_since_epoch().count();
 }
 
+// 128-bit IPv6 byte container (matches boost's address_v6::bytes_type).
+using v6bytes_t = std::array<unsigned char, 16>;
+
 // Per-IP address classification. v4 uses a plain 32-bit host; v6 uses a 60-bit
 // prefix for grouping (a home user is treated as one face) plus a full-address
 // hash to tell distinct addresses apart for the multi-dial counter.
@@ -148,6 +159,7 @@ struct peer_identity
     std::uint32_t subnet30 = 0;    // IPv4 /30
     std::uint64_t v6prefix = 0;    // IPv6 /60
     std::uint64_t v6id = 0;        // IPv6 identity (hashed full address)
+    v6bytes_t v6bytes {};          // full IPv6 bytes (for CIDR matching)
 
     std::uint64_t groupKey() const { return v4 ? host : v6prefix; }
 };
@@ -177,6 +189,7 @@ peer_identity classify_peer(const lt::address &addr)
             hi = (hi << 8) | b[i];
         out.v6prefix = hi & 0xFFFFFFFFFFFFFFF0ULL;
         out.v6id = fnv1a64(b.data(), 16);
+        out.v6bytes = b;
     }
     return out;
 }
@@ -188,6 +201,108 @@ QString formatIPv4(std::uint32_t v)
         .arg(QString::number((v >> 16) & 0xFF))
         .arg(QString::number((v >> 8) & 0xFF))
         .arg(QString::number(v & 0xFF));
+}
+
+// A subscribed CIDR (IP-network) range, as parsed from the BCR rule list.
+struct subnet_v4
+{
+    std::uint32_t net = 0;      // network address, already masked
+    std::uint32_t mask = 0;     // prefix mask
+    int prefix = 0;             // 0..32
+};
+
+struct subnet_v6
+{
+    v6bytes_t net {};           // network bytes, already masked
+    std::uint8_t prefix = 0;    // 0..128
+};
+
+std::uint32_t v4Mask(int prefix)
+{
+    return prefix <= 0 ? 0u : (0xFFFFFFFFu << (32 - prefix));
+}
+
+void maskV6(v6bytes_t &b, int prefix)
+{
+    if (prefix >= 128)
+        return;
+    const int full = prefix / 8;
+    const int rem = prefix % 8;
+    for (int i = full; i < 16; ++i)
+        b[i] = 0;
+    if (rem)
+        b[full] = static_cast<unsigned char>(b[full] & static_cast<unsigned char>(0xFFu << (8 - rem)));
+}
+
+bool v6Contains(const v6bytes_t &peer, const v6bytes_t &net, int prefix)
+{
+    const int full = prefix / 8;
+    const int rem = prefix % 8;
+    for (int i = 0; i < full; ++i)
+    {
+        if (peer[i] != net[i])
+            return false;
+    }
+    if (rem)
+    {
+        const unsigned char m = static_cast<unsigned char>(0xFFu << (8 - rem));
+        if ((peer[full] & m) != (net[full] & m))
+            return false;
+    }
+    return true;
+}
+
+// Parse one BCR line into a v4 or v6 CIDR. Returns 1 = v4 filled, 2 = v6
+// filled, 0 = unparseable (caller should skip the line).
+int parseCIDR(const QString &token, subnet_v4 &s4, subnet_v6 &s6)
+{
+    const QString t = token.trimmed();
+    if (t.isEmpty())
+        return 0;
+
+    QString netPart = t;
+    int prefix = -1;
+    const int slash = t.indexOf(QLatin1Char('/'));
+    if (slash >= 0)
+    {
+        netPart = t.left(slash);
+        bool ok = false;
+        prefix = t.mid(slash + 1).toInt(&ok);
+        if (!ok)
+            prefix = -1;
+    }
+
+    lt::address addr;
+    try
+    {
+        addr = lt::make_address(netPart.toStdString());
+    }
+    catch (const std::exception &)
+    {
+        return 0;
+    }
+
+    if (addr.is_v4())
+    {
+        if (prefix < 0) prefix = 32;
+        if (prefix > 32) prefix = 32;
+        s4.prefix = prefix;
+        s4.mask = v4Mask(prefix);
+        s4.net = classify_peer(addr).host & s4.mask;
+        return 1;
+    }
+
+    if (addr.is_v6())
+    {
+        if (prefix < 0) prefix = 128;
+        if (prefix > 128) prefix = 128;
+        s6.net = addr.to_v6().to_bytes();
+        maskV6(s6.net, prefix);
+        s6.prefix = static_cast<std::uint8_t>(prefix);
+        return 2;
+    }
+
+    return 0;
 }
 
 // Per torrent + IP-group tracked facts (kept across reconnects so a cyclic
@@ -232,6 +347,14 @@ struct behavior_state
     // cache can be serialised on shutdown (the numeric /60 key is derivable from
     // the address but we never store the address itself in the sets above).
     std::vector<std::string> bannedV6Cache;
+
+    // Network IP-set rules (subscribed CIDRs, e.g. PBH-BTN/BTN-Collected-Rules).
+    // Filled at startup by fetchSubscription(); a fresh download replaces the
+    // whole list. Peers whose address falls inside any range are banned. Only
+    // ever written on the app thread before peers attach, read on the network
+    // thread thereafter (no writes after startup => no data race).
+    std::vector<subnet_v4> subV4;
+    std::vector<subnet_v6> subV6;
 };
 
 // ---- peer plugin ------------------------------------------------
@@ -343,10 +466,22 @@ private:
     bool isBanned(const peer_identity &ident) const
     {
         if (ident.v4)
-            return m_state->bannedExact.count(ident.host)
-                   || m_state->bannedSubnet30.count(ident.subnet30)
-                   || m_state->bannedSubnet24.count(ident.subnet24);
-        return m_state->bannedSubnet60.count(ident.v6prefix);
+        {
+            if (m_state->bannedExact.count(ident.host)
+                    || m_state->bannedSubnet30.count(ident.subnet30)
+                    || m_state->bannedSubnet24.count(ident.subnet24))
+                return true;
+            for (const subnet_v4 &s : m_state->subV4)
+                if ((ident.host & s.mask) == s.net)
+                    return true;
+            return false;
+        }
+        if (m_state->bannedSubnet60.count(ident.v6prefix))
+            return true;
+        for (const subnet_v6 &s : m_state->subV6)
+            if (v6Contains(ident.v6bytes, s.net, s.prefix))
+                return true;
+        return false;
     }
 
     void runDetections(const lt::peer_info &info, const peer_identity &ident)
@@ -595,7 +730,11 @@ public:
     peer_behavior_monitor()
         : m_state(std::make_shared<behavior_state>())
     {
+        // Last-known bans (incl. last subscription) first, then refresh the
+        // network IP-set rules from the remote source. If the fetch fails we
+        // keep whatever the cache provided.
         loadBanCache();
+        fetchSubscription();
     }
 
     ~peer_behavior_monitor() override
@@ -676,6 +815,20 @@ private:
                     m_state->bannedV6Cache.push_back(parts[1].toStdString());
                 }
             }
+            else if (parts[0] == QLatin1String("c4"))
+            {
+                subnet_v4 s4;
+                subnet_v6 s6;
+                if (parseCIDR(parts[1], s4, s6) == 1)
+                    m_state->subV4.push_back(s4);
+            }
+            else if (parts[0] == QLatin1String("c6"))
+            {
+                subnet_v4 s4;
+                subnet_v6 s6;
+                if (parseCIDR(parts[1], s4, s6) == 2)
+                    m_state->subV6.push_back(s6);
+            }
         }
     }
 
@@ -699,6 +852,85 @@ private:
             ts << QStringLiteral("s24 ") << formatIPv4(subnet) << '\n';
         for (const std::string &addr : m_state->bannedV6Cache)
             ts << QStringLiteral("v6 ") << QString::fromStdString(addr) << '\n';
+        for (const subnet_v4 &s : m_state->subV4)
+            ts << QStringLiteral("c4 ") << formatIPv4(s.net) << QLatin1Char('/') << s.prefix << '\n';
+        for (const subnet_v6 &s : m_state->subV6)
+            ts << QStringLiteral("c6 ") << QString::fromStdString(lt::address_v6(s.net).to_string())
+               << QLatin1Char('/') << static_cast<int>(s.prefix) << '\n';
+    }
+
+    // Pull the network IP-set rules from the remote source (PBH-BTN/BCR
+    // combined rule list). Only ever runs once at startup on the app thread
+    // before any peer plugin is created, so the lists are fully populated
+    // before the network thread starts reading them (no data race). The fetch
+    // fails soft: on any network/parse error we keep the cached subscription
+    // already loaded by loadBanCache().
+    void fetchSubscription()
+    {
+        QNetworkAccessManager nam;
+        QNetworkRequest request(QUrl(QStringLiteral("https://bcr.pbh-btn.com/combine/all.txt")));
+        request.setTransferTimeout(10000);
+
+        QNetworkReply *reply = nam.get(request);
+        QEventLoop loop;
+        QTimer watchdog;
+        watchdog.setSingleShot(true);
+        bool finished = false;
+        QObject::connect(&watchdog, &QTimer::timeout, &loop, &QEventLoop::quit);
+        QObject::connect(reply, &QNetworkReply::finished, &loop, [&finished, &loop]() {
+            finished = true;
+            loop.quit();
+        });
+        watchdog.start(10000);
+        loop.exec(); // nested event loop; drives the network + timer on this thread
+        watchdog.stop();
+
+        if (finished && (reply->error() == QNetworkReply::NoError))
+        {
+            applySubscriptionBody(reply->readAll());
+            LogMsg(QStringLiteral("BehaviorAntiLeech: loaded %1 v4 and %2 v6 network rules from subscription")
+                       .arg(m_state->subV4.size()).arg(m_state->subV6.size()));
+        }
+        else
+        {
+            LogMsg(QStringLiteral("BehaviorAntiLeech: subscription fetch failed (timeout/error), keeping cached rules"));
+        }
+
+        reply->deleteLater();
+    }
+
+    void applySubscriptionBody(const QByteArray &body)
+    {
+        // A fresh download replaces the whole subscription (cache-only rules
+        // are discarded; they are refreshed on shutdown).
+        m_state->subV4.clear();
+        m_state->subV6.clear();
+
+        QString text = QString::fromUtf8(body);
+        text.remove(QChar(0xFEFF)); // strip any UTF-8 BOM
+        const QStringList lines = text.split(QLatin1Char('\n'));
+        int v4 = 0;
+        int v6 = 0;
+        for (QString line : lines)
+        {
+            line = line.trimmed();
+            if (line.isEmpty() || line.startsWith(QLatin1Char('#')))
+                continue;
+            subnet_v4 s4;
+            subnet_v6 s6;
+            const int kind = parseCIDR(line, s4, s6);
+            if (kind == 1)
+            {
+                m_state->subV4.push_back(s4);
+                ++v4;
+            }
+            else if (kind == 2)
+            {
+                m_state->subV6.push_back(s6);
+                ++v6;
+            }
+        }
+        LogMsg(QStringLiteral("BehaviorAntiLeech: rules refresh applied (%1 v4, %2 v6 CIDRs)").arg(v4).arg(v6));
     }
 
 private:
