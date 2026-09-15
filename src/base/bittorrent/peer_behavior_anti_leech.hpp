@@ -970,16 +970,13 @@ private:
                 m_state->bannedSubnet30.insert(ident.subnet30);
             else if ((parts[0] == QLatin1String("s24")) && ident.v4)
                 m_state->bannedSubnet24.insert(ident.subnet24);
-            else if ((parts[0] == QLatin1String("v6a")) || (parts[0] == QLatin1String("v6m"))
-                 || (parts[0] == QLatin1String("v6")))
+            else if ((parts[0] == QLatin1String("v6a")) || (parts[0] == QLatin1String("v6m")))
             {
                 // Guard against a malformed "v6x <ipv4>" line: classifying an
                 // IPv4 would leave the prefix keys at 0 and ban all of IPv6.
                 if (!ident.v4)
                 {
-                    // v6a = ARB /48, v6m = multi-dial /56. Legacy "v6" tags (the old
-                    // single /60, which covered both roles) are restored as the
-                    // coarser /48 so a previously banned peer stays banned.
+                    // v6a = ARB /48, v6m = multi-dial /56.
                     if (parts[0] == QLatin1String("v6m"))
                         m_state->bannedSubnet56.insert(ident.v6mult);
                     else
