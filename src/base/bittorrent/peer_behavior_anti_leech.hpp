@@ -162,7 +162,7 @@ struct peer_identity
     std::uint32_t subnet30 = 0;    // IPv4 /30
     std::uint64_t v6prefix = 0;    // IPv6 /60
     std::uint64_t v6id = 0;        // IPv6 identity (hashed full address)
-    v6bytes_t v6bytes {};          // full IPv6 bytes (for CIDR matching)
+    v6bytes_t bytes {};            // raw address in the 128-bit trie container (stretched v4 / full v6)
 
     std::uint64_t groupKey() const { return v4 ? host : v6prefix; }
 };
@@ -173,14 +173,21 @@ peer_identity classify_peer(const lt::address &addr)
     if (addr.is_v4())
     {
         const auto b = addr.to_v4().to_bytes();
+        const std::uint32_t host = (static_cast<std::uint32_t>(b[0]) << 24)
+                                 | (static_cast<std::uint32_t>(b[1]) << 16)
+                                 | (static_cast<std::uint32_t>(b[2]) << 8)
+                                 | static_cast<std::uint32_t>(b[3]);
         out.ok = true;
         out.v4 = true;
-        out.host = (static_cast<std::uint32_t>(b[0]) << 24)
-                 | (static_cast<std::uint32_t>(b[1]) << 16)
-                 | (static_cast<std::uint32_t>(b[2]) << 8)
-                 | static_cast<std::uint32_t>(b[3]);
-        out.subnet30 = out.host & 0xFFFFFFFCu;
-        out.subnet24 = out.host & 0xFFFFFF00u;
+        out.host = host;
+        out.subnet30 = host & 0xFFFFFFFCu;
+        out.subnet24 = host & 0xFFFFFF00u;
+        // Stretch into the 128-bit trie container exactly once so the hot
+        // lookup path never rebuilds it on every tick.
+        out.bytes[0] = static_cast<unsigned char>(host >> 24);
+        out.bytes[1] = static_cast<unsigned char>(host >> 16);
+        out.bytes[2] = static_cast<unsigned char>(host >> 8);
+        out.bytes[3] = static_cast<unsigned char>(host);
     }
     else if (addr.is_v6())
     {
@@ -192,7 +199,7 @@ peer_identity classify_peer(const lt::address &addr)
             hi = (hi << 8) | b[i];
         out.v6prefix = hi & 0xFFFFFFFFFFFFFFF0ULL;
         out.v6id = fnv1a64(b.data(), 16);
-        out.v6bytes = b;
+        out.bytes = b;
     }
     return out;
 }
@@ -290,12 +297,13 @@ public:
         n->banned = true;
     }
 
-    // true if `addr` is contained by any inserted rule. Walks at most the
-    // deepest rule prefix (<=128 bits), never the rule count.
-    bool contains(const v6bytes_t &addr) const
+    // true if `addr` is contained by any inserted rule whose prefix length is
+    // at most `bits`. Walks at most `bits` (never the rule count), so a v4
+    // lookup can cap at 32 instead of trailing the zeros of a stretched address.
+    bool contains(const v6bytes_t &addr, int bits) const
     {
         const trie_node *n = &m_root;
-        for (int bit = 0; bit < 128 && n; ++bit)
+        for (int bit = 0; bit < bits && n; ++bit)
         {
             if (n->banned)
                 return true;   // a higher-level prefix already covers addr
@@ -344,10 +352,18 @@ int parseCIDR(const QString &token, subnet_v4 &s4, subnet_v6 &s6)
     if (slash >= 0)
     {
         netPart = t.left(slash);
-        bool ok = false;
-        prefix = t.mid(slash + 1).toInt(&ok);
-        if (!ok)
-            prefix = -1;
+        // Parse the prefix digits in place, avoiding a temporary QString from
+        // mid().toInt(); out-of-range values are clamped below regardless.
+        std::int64_t acc = 0;
+        bool valid = false;
+        for (int i = slash + 1, n = t.size(); i < n; ++i)
+        {
+            const int d = t.at(i).digitValue();
+            if (d < 0) { valid = false; break; }
+            acc = acc * 10 + d;
+            valid = true;
+        }
+        prefix = valid ? static_cast<int>(acc) : -1;
     }
 
     lt::address addr;
@@ -495,7 +511,12 @@ public:
         lt::peer_info info;
         m_peer.get_peer_info(info);
 
-        const auto ident = classify_peer(info.ip.address());
+        // Classify exactly once per connection: the address cannot change on a
+        // live link, so reclassifying (and re-hashing a v6 address) every tick
+        // would be pure waste. registerMembership is idempotent.
+        if (!m_registered)
+            m_identity = classify_peer(info.ip.address());
+        const peer_identity &ident = m_identity;
         if (!ident.ok)
             return; // I2P / non-IP connection, ignore
 
@@ -580,6 +601,17 @@ private:
         }
     }
 
+    // Stable per-connection anchor into the cross-reconnect PCB tracking map.
+    // The (torrentId, ip-group) pair never changes for this plugin and nothing
+    // ever erases from `track`, so resolve the entry once and reuse the pointer
+    // on every tick instead of re-hashing the two-level map each time.
+    peer_track &tracked(const peer_identity &ident)
+    {
+        if (!m_trk)
+            m_trk = &m_state->track[m_torrentId][ident.groupKey()];
+        return *m_trk;
+    }
+
     bool isBanned(const peer_identity &ident) const
     {
         if (ident.v4)
@@ -589,12 +621,12 @@ private:
                     || m_state->bannedSubnet24.count(ident.subnet24))
                 return true;
             const subscription_data *sub = m_state->subscription.load(std::memory_order_acquire);
-            return sub && sub->trieV4.contains(v4HostToBytes(ident.host));
+            return sub && sub->trieV4.contains(ident.bytes, 32);  // v4 prefixes are at most /32
         }
         if (m_state->bannedSubnet60.count(ident.v6prefix))
             return true;
         const subscription_data *sub = m_state->subscription.load(std::memory_order_acquire);
-        return sub && sub->trieV6.contains(ident.v6bytes);
+        return sub && sub->trieV6.contains(ident.bytes, 128);
     }
 
     void runDetections(const lt::peer_info &info, const peer_identity &ident)
@@ -609,7 +641,7 @@ private:
 
         const std::int64_t now = nowMs();
         const float progress = std::clamp(info.progress, 0.0f, 1.0f);
-        peer_track &trk = m_state->track[m_torrentId][ident.groupKey()];
+        peer_track &trk = tracked(ident);
 
         // ---- Cumulative upload tracking (PBH "总上传量/增量") -----------------
         // Survives per-connection counter resets, so a cyclic downloader cannot
@@ -808,6 +840,7 @@ private:
     lt::peer_connection_handle m_peer;
     peer_identity m_identity;
     std::int64_t m_lastUpload = 0;   // last observed total_upload on this connection
+    peer_track *m_trk = nullptr;     // cached PCB-track slot for this connection
     bool m_hasPrevTotal = false;     // whether m_lastUpload is meaningful yet
     bool m_registered = false;
     bool m_attached = true;
