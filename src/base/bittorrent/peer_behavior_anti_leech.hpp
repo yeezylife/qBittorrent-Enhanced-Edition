@@ -514,15 +514,50 @@ struct behavior_state
     }
 };
 
+// ---- per-torrent shared state --------------------------------------------
+// A magnet / URL-seed torrent is attached before its metadata arrives, when
+// torrent_file() is null and neither the size nor the private flag is known.
+// Every peer plugin of one torrent shares a single instance so that a peer
+// which connected before the metadata arrived is not frozen at size 0 (and the
+// torrent cannot dodge the private-tracker exemption). All callbacks run on the
+// single libtorrent network thread, so this is plain, non-atomic data.
+struct torrent_context
+{
+    explicit torrent_context(lt::torrent_handle h)
+        : handle(std::move(h))
+    {
+    }
+
+    // Resolve metadata at most once. After the first resolution the hot
+    // per-tick path is a single boolean test with no handle lookup and no lock;
+    // until then (magnet, metadata pending) it re-probes torrent_file().
+    void ensureResolved()
+    {
+        if (sizeKnown)                          // steady-state: one bool read
+            return;
+        const std::shared_ptr<const lt::torrent_info> tf = handle.torrent_file();
+        if (!tf)                                // magnet: metadata still pending
+            return;
+        disabled = tf->priv();                  // never police private trackers
+        size = tf->total_size();
+        sizeKnown = true;
+    }
+
+    lt::torrent_handle handle;
+    std::int64_t size = 0;
+    bool sizeKnown = false;
+    bool disabled = false;
+};
+
 // ---- peer plugin ------------------------------------------------
 class peer_behavior_plugin final : public lt::peer_plugin
 {
 public:
     peer_behavior_plugin(std::shared_ptr<behavior_state> state, std::uint32_t torrentId
-                         , std::int64_t torrentSize, lt::peer_connection_handle ph)
+                         , std::shared_ptr<torrent_context> ctx, lt::peer_connection_handle ph)
         : m_state(std::move(state))
         , m_torrentId(torrentId)
-        , m_torrentSize(torrentSize)
+        , m_ctx(std::move(ctx))
         , m_peer(ph)
     {
     }
@@ -530,6 +565,14 @@ public:
     void tick() override
     {
         if (!m_state || !m_attached)
+            return;
+
+        // Magnets attach before their metadata exists. Resolve the size and the
+        // private flag once on the shared context; after that this is just one
+        // bool test on the hot path. Private torrents (incl. PT magnets, once the
+        // metadata lands) are never policed.
+        m_ctx->ensureResolved();
+        if (m_ctx->disabled)
             return;
 
         lt::peer_info info;
@@ -656,7 +699,8 @@ private:
 
     void runDetections(const lt::peer_info &info, const peer_identity &ident)
     {
-        if (m_torrentSize < kMinTorrentSizeBytes)
+        const std::int64_t size = m_ctx->size;
+        if (size < kMinTorrentSizeBytes)
             return;
 
         // PBH hands peers still in the handshake the "handshaking" pass; their
@@ -694,10 +738,10 @@ private:
         // ---- (1) Excess download (PBH excessiveClient) -----------------------
         // Uses the cumulative upload count, and floors the allowed excess at
         // max(torrentSize, minimumSize) exactly like PBH.
-        if (trk.statusUploaded > m_torrentSize)
+        if (trk.statusUploaded > size)
         {
             const std::int64_t allowed = static_cast<std::int64_t>(
-                static_cast<double>(std::max(m_torrentSize, kMinTorrentSizeBytes)) * kExcessiveThreshold);
+                static_cast<double>(std::max(size, kMinTorrentSizeBytes)) * kExcessiveThreshold);
             if (trk.statusUploaded > allowed)
             {
                 clearSuspicion(trk);
@@ -709,7 +753,7 @@ private:
         if (!uploading)          // PBH early pass: no uploads -> no progress judgement
             return;
 
-        const double computedProgress = static_cast<double>(trk.statusUploaded) / static_cast<double>(m_torrentSize);
+        const double computedProgress = static_cast<double>(trk.statusUploaded) / static_cast<double>(size);
 
         // ---- (2) Under-reported progress (PBH differenceTest) ---------------
         // Only possible when our computed share exceeds the progress it reports.
@@ -858,8 +902,8 @@ private:
     }
 
     std::shared_ptr<behavior_state> m_state;
+    std::shared_ptr<torrent_context> m_ctx;
     const std::uint32_t m_torrentId;
-    const std::int64_t m_torrentSize;
     lt::peer_connection_handle m_peer;
     peer_identity m_identity;
     std::int64_t m_lastUpload = 0;   // last observed total_upload on this connection
@@ -874,32 +918,26 @@ class peer_behavior_torrent_plugin final : public lt::torrent_plugin
 {
 public:
     peer_behavior_torrent_plugin(std::shared_ptr<behavior_state> state, std::uint32_t torrentId
-                                 , std::int64_t torrentSize, lt::torrent_handle torrent)
+                                 , std::shared_ptr<torrent_context> ctx)
         : m_state(std::move(state))
         , m_torrentId(torrentId)
-        , m_torrentSize(torrentSize)
-        , m_torrent(std::move(torrent))
+        , m_ctx(std::move(ctx))
     {
     }
 
     std::shared_ptr<lt::peer_plugin> new_connection(lt::peer_connection_handle const &ph) override
     {
-        // A magnet / URL-seed torrent is attached before its metadata arrives, so
-        // the size captured at construction is 0. Resolve the real size from the
-        // cached handle as soon as metadata is present; the per-peer
-        // runDetections() guard re-checks it, so no false detection can fire for a
-        // torrent that is genuinely below the minimum. Everything here runs on the
-        // single libtorrent network thread, so no locking is needed.
-        if ((m_torrentSize < kMinTorrentSizeBytes) && m_torrent.torrent_file())
-            m_torrentSize = m_torrent.torrent_file()->total_size();
-        return std::make_shared<peer_behavior_plugin>(m_state, m_torrentId, m_torrentSize, ph);
+        // Magnet peers can connect before the metadata arrives; they all share
+        // m_ctx, so resolving it here (and lazily on their own tick) lets every
+        // connection - old or new - act on the real size / private flag.
+        m_ctx->ensureResolved();
+        return std::make_shared<peer_behavior_plugin>(m_state, m_torrentId, m_ctx, ph);
     }
 
 private:
     std::shared_ptr<behavior_state> m_state;
     const std::uint32_t m_torrentId;
-    std::int64_t m_torrentSize;
-    lt::torrent_handle m_torrent;
+    std::shared_ptr<torrent_context> m_ctx;
 };
 
 // ---- session plugin ---------------------------------------------
@@ -927,18 +965,19 @@ public:
 
     std::shared_ptr<lt::torrent_plugin> new_torrent(lt::torrent_handle const &th, client_data) override
     {
-        // Private torrents are skipped only when metadata is already known. A
-        // magnet / URL-seed add has no torrent_file() yet, so its privateness is
-        // simply unknowable here; we attach anyway and resolve the size lazily.
+        // Private torrents whose metadata is already known are skipped outright.
+        // A magnet / URL-seed add has no torrent_file() yet, so its privateness
+        // and size are unknowable here; we attach a shared torrent_context and
+        // resolve them lazily (once) on the network thread. That covers magnets
+        // / RSS magnet URLs and still keeps the private-tracker exemption intact
+        // as soon as the metadata lands.
         const std::shared_ptr<const lt::torrent_info> tf = th.torrent_file();
         if (tf && tf->priv())
             return nullptr;
-        // If the size is not yet known, still attach: runDetections() re-checks
-        // m_torrentSize on every tick, and new_connection() refreshes it from the
-        // handle once the metadata arrives, so magnets / RSS (which may embed
-        // magnet URLs) get behavioural anti-leech coverage too.
-        const std::int64_t size = tf ? tf->total_size() : 0;
-        return std::make_shared<peer_behavior_torrent_plugin>(m_state, m_nextId++, size, th);
+        auto ctx = std::make_shared<torrent_context>(th);
+        if (tf)
+            ctx->ensureResolved();   // fully-known torrent: no lazy work later
+        return std::make_shared<peer_behavior_torrent_plugin>(m_state, m_nextId++, std::move(ctx));
     }
 
 private:
