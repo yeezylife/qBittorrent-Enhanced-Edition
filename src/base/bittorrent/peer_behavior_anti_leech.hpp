@@ -33,13 +33,14 @@
 //
 // NOTE ON THREADING / DEADLOCKS
 // All callbacks of a libtorrent plugin run on the libtorrent network thread.
-// Calling any blocking *public* session/torrent API from there (get_torrents,
-// torrent_handle::get_peer_info, set_ip_filter, ...) deadlocks. Therefore this
-// implementation performs NO session-wide enumeration: every peer plugin
-// maintains the shared state, and enforcement is done by each peer
-// disconnecting *itself* when its own address ends up on a ban list. The only
-// libtorrent APIs touched from inside the plugin are peer_connection_handle
-// (get_peer_info / disconnect), which are designed to be plugin-safe.
+// Calling most *public* session/torrent APIs from there (session::get_torrents,
+// session::set_ip_filter, ...) deadlocks. Therefore this implementation
+// performs NO session-wide enumeration: every peer plugin maintains the shared
+// state, and enforcement is done by each peer disconnecting *itself* when its
+// own address ends up on a ban list. The only libtorrent APIs touched from
+// inside a plugin are peer_connection_handle (get_peer_info / disconnect) and a
+// lazy, cache-only torrent_handle::torrent_file() used once to resolve a
+// magnet's size / private flag - both are safe to call on the network thread.
 //
 // The queueing decision thresholds below are intentionally *aggressive*
 // ("宁错杀不放过"): tune them down if you get too many false positives.
@@ -528,19 +529,22 @@ struct torrent_context
     {
     }
 
-    // Resolve metadata at most once. After the first resolution the hot
-    // per-tick path is a single boolean test with no handle lookup and no lock;
-    // until then (magnet, metadata pending) it re-probes torrent_file().
+    // Resolve metadata at most once. After the first successful resolution the
+    // hot per-tick path is a single boolean test with no handle lookup and no
+    // lock, and the torrent handle is dropped (the torrent's lifetime is already
+    // pinned by its plugin). Until then (magnet, metadata pending) it re-probes
+    // torrent_file().
     void ensureResolved()
     {
         if (sizeKnown)                          // steady-state: one bool read
             return;
-        const std::shared_ptr<const lt::torrent_info> tf = handle.torrent_file();
+        const auto tf = handle.torrent_file();
         if (!tf)                                // magnet: metadata still pending
             return;
         disabled = tf->priv();                  // never police private trackers
         size = tf->total_size();
         sizeKnown = true;
+        handle = {};                            // resolved: release the handle
     }
 
     lt::torrent_handle handle;
@@ -567,12 +571,14 @@ public:
         if (!m_state || !m_attached)
             return;
 
-        // Magnets attach before their metadata exists. Resolve the size and the
-        // private flag once on the shared context; after that this is just one
-        // bool test on the hot path. Private torrents (incl. PT magnets, once the
-        // metadata lands) are never policed.
-        m_ctx->ensureResolved();
-        if (m_ctx->disabled)
+        // Metadata resolution belongs to the torrent plugin (its tick(), with
+        // new_connection() as an immediate fallback); this peer only reads the
+        // shared m_ctx. While a magnet's metadata is still pending (sizeKnown
+        // false) - or forever if it never arrives - the whole plugin sleeps, so
+        // no ban, membership or detection logic runs in any metadata window. A
+        // private magnet is never policed, and a never-resolving magnet costs no
+        // per-peer work each second.
+        if (!m_ctx->sizeKnown || m_ctx->disabled)
             return;
 
         lt::peer_info info;
@@ -927,11 +933,20 @@ public:
 
     std::shared_ptr<lt::peer_plugin> new_connection(lt::peer_connection_handle const &ph) override
     {
-        // Magnet peers can connect before the metadata arrives; they all share
-        // m_ctx, so resolving it here (and lazily on their own tick) lets every
-        // connection - old or new - act on the real size / private flag.
+        // Immediate fallback so a connection (e.g. on a torrent whose metadata
+        // is already known, or one that arrived right before this connect)
+        // resolves without waiting for the next tick. Idempotent and cheap once
+        // sizeKnown is set.
         m_ctx->ensureResolved();
         return std::make_shared<peer_behavior_plugin>(m_state, m_torrentId, m_ctx, ph);
+    }
+
+    // Central resolution point: one per-torrent re-probe per second (instead of
+    // one per peer) while a magnet's metadata is pending. Once resolved this is
+    // just a single bool test and the shared handle is already released.
+    void tick() override
+    {
+        m_ctx->ensureResolved();
     }
 
 private:
