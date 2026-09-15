@@ -28,7 +28,7 @@
 //         same torrent. Beyond a tolerance it is treated as one user hogging
 //         many connections to refuse to trade -> ban the whole subnet.
 //   3. 自动范围封禁 / Auto range-ban
-//       - whenever an IP is banned the neighbouring /30 (v4) /60 (v6) range
+//       - whenever an IP is banned the neighbouring /30 (v4) /48 (v6) range
 //         is banned too, and every peer in it self-disconnects.
 //
 // NOTE ON THREADING / DEADLOCKS
@@ -108,9 +108,12 @@ constexpr bool kBlockExcessive = true;
 // PBH floors the allowed excess at max(torrentSize, torrentMinimumSize).
 constexpr float kExcessiveThreshold = 1.1f;
 
-// Multi-dial subnet prefixes.
+// Multi-dial subnet prefixes. IPv6 grouping matches PBH (IPV6 prefix length 56).
 constexpr int kSubnetV4 = 24;
-constexpr int kSubnetV6 = 60;
+constexpr int kSubnetV6 = 56;
+// Auto range-ban (PBH auto-range-ban ipv6) uses a coarser IPv6 /48 so a whole
+// residential prefix is covered and an attacker cannot hide by spreading IPs
+// across a handful of /56s. The /48 mask appears in classify_peer.
 // Distinct IPs of the same subnet connected to the same torrent that are
 // tolerated. Ban once the count is *above* these values.
 constexpr int kTolerateV4 = 1;
@@ -160,7 +163,9 @@ struct peer_identity
     std::uint32_t host = 0;        // full IPv4 address
     std::uint32_t subnet24 = 0;    // IPv4 /24
     std::uint32_t subnet30 = 0;    // IPv4 /30
-    std::uint64_t v6prefix = 0;    // IPv6 /60
+    std::uint64_t v6prefix = 0;    // IPv6 /60 (PCB track identity)
+    std::uint64_t v6mult = 0;      // IPv6 /56 subnet (multi-dial grouping)
+    std::uint64_t v6arb = 0;       // IPv6 /48 subnet (auto range-ban)
     std::uint64_t v6id = 0;        // IPv6 identity (hashed full address)
     v6bytes_t bytes {};            // raw address in the 128-bit trie container (stretched v4 / full v6)
 
@@ -197,7 +202,9 @@ peer_identity classify_peer(const lt::address &addr)
         std::uint64_t hi = 0;
         for (int i = 0; i < 8; ++i)
             hi = (hi << 8) | b[i];
-        out.v6prefix = hi & 0xFFFFFFFFFFFFFFF0ULL;
+        out.v6prefix = hi & 0xFFFFFFFFFFFFFFF0ULL;   // /60 (PCB track identity)
+        out.v6mult = hi & 0xFFFFFFFFFFFFFF00ULL;     // /56 (multi-dial subnet)
+        out.v6arb = hi & 0xFFFFFFFFFFFF0000ULL;      // /48 (auto range-ban)
         out.v6id = fnv1a64(b.data(), 16);
         out.bytes = b;
     }
@@ -242,6 +249,18 @@ void maskV6(v6bytes_t &b, int prefix)
         b[i] = 0;
     if (rem)
         b[full] = static_cast<unsigned char>(b[full] & static_cast<unsigned char>(0xFFu << (8 - rem)));
+}
+
+// Expand a 64-bit most-significant-half key (e.g. a /48 or /56 subnet derived in
+// classify_peer) back into a 128-bit byte container, so a numeric ban key can be
+// rendered as an IPv6 network string for the ban cache. Only used for (re)serialising
+// the cache, never on a hot path.
+v6bytes_t v6HiToBytes(std::uint64_t hi)
+{
+    v6bytes_t b {};
+    for (int i = 0; i < 8; ++i)
+        b[i] = static_cast<unsigned char>(hi >> (56 - 8 * i));
+    return b;
 }
 
 // Stretch an IPv4 host (b[0] is the most-significant octet, as produced by
@@ -440,15 +459,11 @@ struct behavior_state
     std::unordered_map<std::uint32_t, std::unordered_map<std::uint64_t, std::unordered_map<std::uint64_t, int>>> subnetsV6;
 
     // global ban lists
-    std::unordered_set<std::uint64_t> bannedExact;      // v4 host / v6 /60 key
+    std::unordered_set<std::uint64_t> bannedExact;      // v4 exact host (progress/behaviour bans)
     std::unordered_set<std::uint32_t> bannedSubnet30;   // v4 /30 (auto range-ban)
     std::unordered_set<std::uint32_t> bannedSubnet24;   // v4 /24 (multi-dial)
-    std::unordered_set<std::uint64_t> bannedSubnet60;   // v6 /60 (range + multi-dial)
-
-    // Canonical IPv6 strings of every banned /60 prefix, kept only so the ban
-    // cache can be serialised on shutdown (the numeric /60 key is derivable from
-    // the address but we never store the address itself in the sets above).
-    std::vector<std::string> bannedV6Cache;
+    std::unordered_set<std::uint64_t> bannedSubnet48;   // v6 /48 (auto range-ban)
+    std::unordered_set<std::uint64_t> bannedSubnet56;   // v6 /56 (multi-dial)
 
     // Network IP-set rules (subscribed CIDRs, e.g. PBH-BTN/BTN-Collected-Rules).
     // Published as a single immutable snapshot. The only writer is the app thread
@@ -549,7 +564,7 @@ public:
             }
             else
             {
-                auto &subnetMap = m_state->subnetsV6[m_torrentId][m_identity.v6prefix];
+                auto &subnetMap = m_state->subnetsV6[m_torrentId][m_identity.v6mult];
                 auto it = subnetMap.find(m_identity.v6id);
                 if (it != subnetMap.end())
                 {
@@ -574,7 +589,7 @@ private:
         if (ident.v4)
             ++m_state->subnetsV4[m_torrentId][ident.subnet24][ident.host];
         else
-            ++m_state->subnetsV6[m_torrentId][ident.v6prefix][ident.v6id];
+            ++m_state->subnetsV6[m_torrentId][ident.v6mult][ident.v6id];
         m_registered = true;
 
         // A subnet's membership only changes at connect/disconnect, so checking
@@ -595,9 +610,9 @@ private:
         }
         else
         {
-            const auto &subnetMap = m_state->subnetsV6[m_torrentId][ident.v6prefix];
+            const auto &subnetMap = m_state->subnetsV6[m_torrentId][ident.v6mult];
             if (subnetMap.size() > kTolerateV6)
-                banSubnetV6(ident.v6prefix);
+                banSubnetV6(ident.v6mult);
         }
     }
 
@@ -623,7 +638,8 @@ private:
             const subscription_data *sub = m_state->subscription.load(std::memory_order_acquire);
             return sub && sub->trieV4.contains(ident.bytes, 32);  // v4 prefixes are at most /32
         }
-        if (m_state->bannedSubnet60.count(ident.v6prefix))
+        if (m_state->bannedSubnet56.count(ident.v6mult)
+            || m_state->bannedSubnet48.count(ident.v6arb))
             return true;
         const subscription_data *sub = m_state->subscription.load(std::memory_order_acquire);
         return sub && sub->trieV6.contains(ident.bytes, 128);
@@ -770,10 +786,9 @@ private:
         }
         else
         {
-            newlyBanned = !m_state->bannedSubnet60.count(ident.v6prefix);
-            m_state->bannedSubnet60.insert(ident.v6prefix);
-            if (newlyBanned)
-                m_state->bannedV6Cache.push_back(m_peer.remote().address().to_string());
+            // auto range-ban: also cover the neighbouring /48 (v6)
+            newlyBanned = !m_state->bannedSubnet48.count(ident.v6arb);
+            m_state->bannedSubnet48.insert(ident.v6arb);
         }
 
         if (newlyBanned)
@@ -813,13 +828,12 @@ private:
         disconnectNow();
     }
 
-    void banSubnetV6(std::uint64_t prefix60)
+    void banSubnetV6(std::uint64_t subnet56)
     {
-        if (m_state->bannedSubnet60.count(prefix60))
+        if (m_state->bannedSubnet56.count(subnet56))
             return;
 
-        m_state->bannedSubnet60.insert(prefix60);
-        m_state->bannedV6Cache.push_back(m_peer.remote().address().to_string());
+        m_state->bannedSubnet56.insert(subnet56);
 
         LogMsg(u"行为反吸血: 多拨封禁 整个 /%1 网段 (IP: %2)"_s
                    .arg(kSubnetV6)
@@ -911,7 +925,8 @@ private:
     //   v4   203.0.113.5   (exact IPv4 host)
     //   s30  203.0.113.4   (banned /30)
     //   s24  203.0.113.0   (banned /24, multi-dial)
-    //   v6   2001:db8::1   (banned /60, range + multi-dial)
+    //   v6a  2001:db8::   (banned /48, auto range-ban)
+    //   v6m  2001:db8::/56   (banned /56, multi-dial)
     void loadBanCache()
     {
         const Path dir = specialFolderLocation(SpecialFolder::Data);
@@ -955,17 +970,20 @@ private:
                 m_state->bannedSubnet30.insert(ident.subnet30);
             else if ((parts[0] == QLatin1String("s24")) && ident.v4)
                 m_state->bannedSubnet24.insert(ident.subnet24);
-            else if (parts[0] == QLatin1String("v6"))
+            else if ((parts[0] == QLatin1String("v6a")) || (parts[0] == QLatin1String("v6m"))
+                 || (parts[0] == QLatin1String("v6")))
             {
-                // Guard against a malformed "v6 <ipv4>" line: classifying an
-                // IPv4 would leave v6prefix at 0 and ban all of IPv6.
+                // Guard against a malformed "v6x <ipv4>" line: classifying an
+                // IPv4 would leave the prefix keys at 0 and ban all of IPv6.
                 if (!ident.v4)
                 {
-                    m_state->bannedSubnet60.insert(ident.v6prefix);
-                    // Re-seed the address-string cache so a restored /60 is kept
-                    // on the next shutdown (the cache is only populated by *new*
-                    // v6 bans at runtime, so we must restock it here).
-                    m_state->bannedV6Cache.push_back(parts[1].toStdString());
+                    // v6a = ARB /48, v6m = multi-dial /56. Legacy "v6" tags (the old
+                    // single /60, which covered both roles) are restored as the
+                    // coarser /48 so a previously banned peer stays banned.
+                    if (parts[0] == QLatin1String("v6m"))
+                        m_state->bannedSubnet56.insert(ident.v6mult);
+                    else
+                        m_state->bannedSubnet48.insert(ident.v6arb);
                 }
             }
             else if (parts[0] == QLatin1String("c4"))
@@ -1009,8 +1027,12 @@ private:
             ts << QStringLiteral("s30 ") << formatIPv4(subnet) << '\n';
         for (const std::uint32_t subnet : m_state->bannedSubnet24)
             ts << QStringLiteral("s24 ") << formatIPv4(subnet) << '\n';
-        for (const std::string &addr : m_state->bannedV6Cache)
-            ts << QStringLiteral("v6 ") << QString::fromStdString(addr) << '\n';
+        // v6a = /48 (auto range-ban), v6m = /56 (multi-dial). The stored network
+        // string already has its host bits zeroed, so its prefix is self-evident.
+        for (const std::uint64_t sub : m_state->bannedSubnet48)
+            ts << QStringLiteral("v6a ") << lt::address_v6(v6HiToBytes(sub)).to_string() << '\n';
+        for (const std::uint64_t sub : m_state->bannedSubnet56)
+            ts << QStringLiteral("v6m ") << lt::address_v6(v6HiToBytes(sub)).to_string() << '\n';
 
         const subscription_data *sub = m_state->subscription.load(std::memory_order_acquire);
         for (const subnet_v4 &s : sub->v4)
