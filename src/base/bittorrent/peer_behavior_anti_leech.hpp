@@ -62,6 +62,7 @@
 #include <libtorrent/extensions.hpp>
 #include <libtorrent/peer_connection_handle.hpp>
 #include <libtorrent/peer_info.hpp>
+#include <libtorrent/torrent_handle.hpp>
 #include <libtorrent/socket.hpp>
 
 #include <QByteArray>
@@ -873,22 +874,32 @@ class peer_behavior_torrent_plugin final : public lt::torrent_plugin
 {
 public:
     peer_behavior_torrent_plugin(std::shared_ptr<behavior_state> state, std::uint32_t torrentId
-                                 , std::int64_t torrentSize)
+                                 , std::int64_t torrentSize, lt::torrent_handle torrent)
         : m_state(std::move(state))
         , m_torrentId(torrentId)
         , m_torrentSize(torrentSize)
+        , m_torrent(std::move(torrent))
     {
     }
 
     std::shared_ptr<lt::peer_plugin> new_connection(lt::peer_connection_handle const &ph) override
     {
+        // A magnet / URL-seed torrent is attached before its metadata arrives, so
+        // the size captured at construction is 0. Resolve the real size from the
+        // cached handle as soon as metadata is present; the per-peer
+        // runDetections() guard re-checks it, so no false detection can fire for a
+        // torrent that is genuinely below the minimum. Everything here runs on the
+        // single libtorrent network thread, so no locking is needed.
+        if ((m_torrentSize < kMinTorrentSizeBytes) && m_torrent.torrent_file())
+            m_torrentSize = m_torrent.torrent_file()->total_size();
         return std::make_shared<peer_behavior_plugin>(m_state, m_torrentId, m_torrentSize, ph);
     }
 
 private:
     std::shared_ptr<behavior_state> m_state;
     const std::uint32_t m_torrentId;
-    const std::int64_t m_torrentSize;
+    std::int64_t m_torrentSize;
+    lt::torrent_handle m_torrent;
 };
 
 // ---- session plugin ---------------------------------------------
@@ -916,15 +927,18 @@ public:
 
     std::shared_ptr<lt::torrent_plugin> new_torrent(lt::torrent_handle const &th, client_data) override
     {
-        // ignore private torrents
-        if (th.torrent_file() && th.torrent_file()->priv())
+        // Private torrents are skipped only when metadata is already known. A
+        // magnet / URL-seed add has no torrent_file() yet, so its privateness is
+        // simply unknowable here; we attach anyway and resolve the size lazily.
+        const std::shared_ptr<const lt::torrent_info> tf = th.torrent_file();
+        if (tf && tf->priv())
             return nullptr;
-
-        const std::int64_t size = th.torrent_file() ? th.torrent_file()->total_size() : 0;
-        if (size < kMinTorrentSizeBytes)
-            return nullptr;
-
-        return std::make_shared<peer_behavior_torrent_plugin>(m_state, m_nextId++, size);
+        // If the size is not yet known, still attach: runDetections() re-checks
+        // m_torrentSize on every tick, and new_connection() refreshes it from the
+        // handle once the metadata arrives, so magnets / RSS (which may embed
+        // magnet URLs) get behavioural anti-leech coverage too.
+        const std::int64_t size = tf ? tf->total_size() : 0;
+        return std::make_shared<peer_behavior_torrent_plugin>(m_state, m_nextId++, size, th);
     }
 
 private:
