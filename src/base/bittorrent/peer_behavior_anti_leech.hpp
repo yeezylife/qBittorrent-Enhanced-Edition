@@ -1034,9 +1034,9 @@ private:
         // v6a = /48 (auto range-ban), v6m = /56 (multi-dial). The stored network
         // string already has its host bits zeroed, so its prefix is self-evident.
         for (const std::uint64_t sub : m_state->bannedSubnet48)
-            ts << QStringLiteral("v6a ") << lt::address_v6(v6HiToBytes(sub)).to_string() << '\n';
+            ts << QStringLiteral("v6a ") << QString::fromStdString(lt::address_v6(v6HiToBytes(sub)).to_string()) << '\n';
         for (const std::uint64_t sub : m_state->bannedSubnet56)
-            ts << QStringLiteral("v6m ") << lt::address_v6(v6HiToBytes(sub)).to_string() << '\n';
+            ts << QStringLiteral("v6m ") << QString::fromStdString(lt::address_v6(v6HiToBytes(sub)).to_string()) << '\n';
 
         const subscription_data *sub = m_state->subscription.load(std::memory_order_acquire);
         for (const subnet_v4 &s : sub->v4)
