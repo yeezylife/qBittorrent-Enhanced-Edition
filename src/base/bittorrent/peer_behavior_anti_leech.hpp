@@ -312,15 +312,23 @@ public:
             n = n->child[b];
         }
         n->banned = true;
+        if (prefix > m_maxDepth)
+            m_maxDepth = prefix;   // tightens every later query to the deepest rule
     }
 
     // true if `addr` is contained by any inserted rule whose prefix length is
-    // at most `bits`. Walks at most `bits` (never the rule count), so a v4
-    // lookup can cap at 32 instead of trailing the zeros of a stretched address.
+    // at most `bits`. Walks at most min(bits, m_maxDepth) nodes (never the rule
+    // count): a terminal can only exist at a depth already inserted, so a v4
+    // lookup caps at 32 and a v6 lookup stops at the deepest rule instead of
+    // trailing the zeros of a stretched address. A /0 rule sets root.banned and
+    // is matched by the first check regardless of depth.
     bool contains(const v6bytes_t &addr, int bits) const
     {
         const trie_node *n = &m_root;
-        for (int bit = 0; bit < bits && n; ++bit)
+        if (n->banned)
+            return true;   // a /0 rule (whole-family) covers addr
+        const int depth = (bits < m_maxDepth) ? bits : m_maxDepth;
+        for (int bit = 0; bit < depth && n; ++bit)
         {
             if (n->banned)
                 return true;   // a higher-level prefix already covers addr
@@ -331,6 +339,7 @@ public:
     }
 
 private:
+    int m_maxDepth = 0;
     static void deleteNode(trie_node *n)
     {
         if (!n)
@@ -1100,30 +1109,50 @@ private:
     // state, so a rejected body never disturbs the published snapshot.
     static std::size_t parseSubscriptionBody(const QByteArray &body, subscription_data &out)
     {
-        QString text = QString::fromUtf8(body);
-        text.remove(QChar(0xFEFF)); // strip any UTF-8 BOM
-        const QStringList lines = text.split(QLatin1Char('\n'));
         std::size_t parsed = 0;
-        for (QString line : lines)
+        // Single in-place pass over the raw bytes: no whole-buffer QString copy,
+        // no BOM-removal rewrite, and no QStringList of per-line QStrings. Blank
+        // and '#' lines are skipped on the raw bytes; only the lines that need
+        // parsing are materialized into a small per-line QString.
+        const char *p = body.constData();
+        const int len = body.size();
+        int lineStart = ((len >= 3)
+            && (static_cast<unsigned char>(p[0]) == 0xEF)
+            && (static_cast<unsigned char>(p[1]) == 0xBB)
+            && (static_cast<unsigned char>(p[2]) == 0xBF)) ? 3 : 0; // strip UTF-8 BOM
+        while (lineStart < len)
         {
-            line = line.trimmed();
-            if (line.isEmpty() || line.startsWith(QLatin1Char('#')))
-                continue;
-            subnet_v4 s4;
-            subnet_v6 s6;
-            const int kind = parseCIDR(line, s4, s6);
-            if (kind == 1)
+            int eol = lineStart;
+            while (eol < len && p[eol] != '\n')
+                ++eol;
+            int b = lineStart;
+            int e = eol;
+            if (e > b && p[e - 1] == '\r')         // drop trailing CR
+                --e;
+            while (b < e && (p[b] == ' ' || p[b] == '\t'))
+                ++b;
+            while (e > b && (p[e - 1] == ' ' || p[e - 1] == '\t'))
+                --e;
+            if (e > b && p[b] != '#')   // skip blanks and comment lines
             {
-                out.v4.push_back(s4);
-                out.trieV4.insert(v4HostToBytes(s4.net), s4.prefix);
-                ++parsed;
+                const QString line = QString::fromUtf8(p + b, e - b);
+                subnet_v4 s4;
+                subnet_v6 s6;
+                const int kind = parseCIDR(line, s4, s6);
+                if (kind == 1)
+                {
+                    out.v4.push_back(s4);
+                    out.trieV4.insert(v4HostToBytes(s4.net), s4.prefix);
+                    ++parsed;
+                }
+                else if (kind == 2)
+                {
+                    out.v6.push_back(s6);
+                    out.trieV6.insert(s6.net, s6.prefix);
+                    ++parsed;
+                }
             }
-            else if (kind == 2)
-            {
-                out.v6.push_back(s6);
-                out.trieV6.insert(s6.net, s6.prefix);
-                ++parsed;
-            }
+            lineStart = eol + 1;
         }
         return parsed;
     }
