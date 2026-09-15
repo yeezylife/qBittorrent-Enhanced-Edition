@@ -152,7 +152,7 @@ std::int64_t nowMs()
 // 128-bit IPv6 byte container (matches boost's address_v6::bytes_type).
 using v6bytes_t = std::array<unsigned char, 16>;
 
-// Per-IP address classification. v4 uses a plain 32-bit host; v6 uses a 60-bit
+// Per-IP address classification. v4 uses a plain 32-bit host; v6 uses a 56-bit
 // prefix for grouping (a home user is treated as one face) plus a full-address
 // hash to tell distinct addresses apart for the multi-dial counter.
 struct peer_identity
@@ -160,16 +160,15 @@ struct peer_identity
     bool ok = false;
     bool v4 = false;
 
-    std::uint32_t host = 0;        // full IPv4 address
+    std::uint32_t host = 0;        // full IPv4 address (/32 PCB identity)
     std::uint32_t subnet24 = 0;    // IPv4 /24
     std::uint32_t subnet30 = 0;    // IPv4 /30
-    std::uint64_t v6prefix = 0;    // IPv6 /60 (PCB track identity)
-    std::uint64_t v6mult = 0;      // IPv6 /56 subnet (multi-dial grouping)
+    std::uint64_t v6mult = 0;      // IPv6 /56 subnet (PCB identity + multi-dial grouping)
     std::uint64_t v6arb = 0;       // IPv6 /48 subnet (auto range-ban)
     std::uint64_t v6id = 0;        // IPv6 identity (hashed full address)
     v6bytes_t bytes {};            // raw address in the 128-bit trie container (stretched v4 / full v6)
 
-    std::uint64_t groupKey() const { return v4 ? host : v6prefix; }
+    std::uint64_t groupKey() const { return v4 ? host : v6mult; }
 };
 
 peer_identity classify_peer(const lt::address &addr)
@@ -202,8 +201,7 @@ peer_identity classify_peer(const lt::address &addr)
         std::uint64_t hi = 0;
         for (int i = 0; i < 8; ++i)
             hi = (hi << 8) | b[i];
-        out.v6prefix = hi & 0xFFFFFFFFFFFFFFF0ULL;   // /60 (PCB track identity)
-        out.v6mult = hi & 0xFFFFFFFFFFFFFF00ULL;     // /56 (multi-dial subnet)
+        out.v6mult = hi & 0xFFFFFFFFFFFFFF00ULL;     // /56 (PCB identity + multi-dial subnet)
         out.v6arb = hi & 0xFFFFFFFFFFFF0000ULL;      // /48 (auto range-ban)
         out.v6id = fnv1a64(b.data(), 16);
         out.bytes = b;
@@ -925,8 +923,8 @@ private:
     //   v4   203.0.113.5   (exact IPv4 host)
     //   s30  203.0.113.4   (banned /30)
     //   s24  203.0.113.0   (banned /24, multi-dial)
-    //   v6a  2001:db8::   (banned /48, auto range-ban)
-    //   v6m  2001:db8::/56   (banned /56, multi-dial)
+    //   v6a  2001:db8::   (banned /48, auto range-ban; host bits already zeroed)
+    //   v6m  2001:db8::   (banned /56, multi-dial; host bits already zeroed)
     void loadBanCache()
     {
         const Path dir = specialFolderLocation(SpecialFolder::Data);
