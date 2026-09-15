@@ -104,7 +104,6 @@ constexpr float kRewindMaxDiff = 0.02f;
 constexpr std::int64_t kBanConfirmDelayMs = 1500;
 
 // Ban peers whose cumulative download from us exceeds this threshold.
-constexpr bool kBlockExcessive = true;
 // PBH floors the allowed excess at max(torrentSize, torrentMinimumSize).
 constexpr float kExcessiveThreshold = 1.1f;
 
@@ -211,11 +210,10 @@ peer_identity classify_peer(const lt::address &addr)
 
 QString formatIPv4(std::uint32_t v)
 {
-    return QStringLiteral("%1.%2.%3.%4")
-        .arg(QString::number((v >> 24) & 0xFF))
-        .arg(QString::number((v >> 16) & 0xFF))
-        .arg(QString::number((v >> 8) & 0xFF))
-        .arg(QString::number(v & 0xFF));
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%u.%u.%u.%u"
+                  , (v >> 24) & 0xFFu, (v >> 16) & 0xFFu, (v >> 8) & 0xFFu, v & 0xFFu);
+    return QString::fromLatin1(buf);
 }
 
 // A subscribed CIDR (IP-network) range, as parsed from the BCR rule list.
@@ -695,7 +693,7 @@ private:
         // ---- (1) Excess download (PBH excessiveClient) -----------------------
         // Uses the cumulative upload count, and floors the allowed excess at
         // max(torrentSize, minimumSize) exactly like PBH.
-        if (kBlockExcessive && (trk.statusUploaded > m_torrentSize))
+        if (trk.statusUploaded > m_torrentSize)
         {
             const std::int64_t allowed = static_cast<std::int64_t>(
                 static_cast<double>(std::max(m_torrentSize, kMinTorrentSizeBytes)) * kExcessiveThreshold);
