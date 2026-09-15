@@ -21,11 +21,8 @@ bool is_bad_peer(const lt::peer_info& info)
   // Some PCDN/freeloading nodes pretend to be an old qBittorrent build (seen as seeders but barely upload).
 
   // plain substring match: O(n), much cheaper than a std::regex_search
-  // 针对疑似 PCDN 伪装的多个旧版 qBittorrent 构建号
-  if (info.client.find("qBittorrent/4.6.7") != std::string::npos
-      || info.client.find("qBittorrent/4.6.8") != std::string::npos
-      || info.client.find("qBittorrent/4.5.4") != std::string::npos
-      || info.client.find("qBittorrent/4.5.5") != std::string::npos)
+  // 针对疑似 PCDN 伪装的 qBittorrent 4.6.7 构建号
+  if (info.client.find("qBittorrent/4.6.7") != std::string::npos)
     return true;
 
   // 吸血 / PCDN 签名 —— 全球封禁
