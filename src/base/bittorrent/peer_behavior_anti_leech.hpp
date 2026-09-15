@@ -986,7 +986,7 @@ public:
         // resolve them lazily (once) on the network thread. That covers magnets
         // / RSS magnet URLs and still keeps the private-tracker exemption intact
         // as soon as the metadata lands.
-        const std::shared_ptr<const lt::torrent_info> tf = th.torrent_file();
+        const auto tf = th.torrent_file();
         if (tf && tf->priv())
             return nullptr;
         auto ctx = std::make_shared<torrent_context>(th);
