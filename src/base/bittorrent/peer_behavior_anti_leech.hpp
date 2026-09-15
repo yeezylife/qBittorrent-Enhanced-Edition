@@ -55,7 +55,6 @@
 #include <unordered_set>
 
 #include <atomic>
-#include <memory>
 
 #include <boost/asio/error.hpp>
 
@@ -365,6 +364,11 @@ int parseCIDR(const QString &token, subnet_v4 &s4, subnet_v6 &s6)
     {
         if (prefix < 0) prefix = 32;
         if (prefix > 32) prefix = 32;
+        // A /0 line is a legitimate (if drastic) whole-family ban: with prefix 0
+        // the trie_root.banned flag is set and every IPv4 address matches. This
+        // reproduces the pre-trie v4Mask(0)==0 linear scan, so it is not a
+        // regression; it only matters that the subscription source never lists
+        // such an entry accidentally.
         s4.prefix = prefix;
         s4.mask = v4Mask(prefix);
         s4.net = classify_peer(addr).host & s4.mask;
@@ -375,6 +379,9 @@ int parseCIDR(const QString &token, subnet_v4 &s4, subnet_v6 &s6)
     {
         if (prefix < 0) prefix = 128;
         if (prefix > 128) prefix = 128;
+        // A /0 line marks the whole of IPv6 for banning (trie_root.banned),
+        // matching the old v6Contains(_,_,0) which always returned true. Kept as
+        // intentional, policy-level behaviour for symmetry with the v4 branch.
         s6.net = addr.to_v6().to_bytes();
         maskV6(s6.net, prefix);
         s6.prefix = static_cast<std::uint8_t>(prefix);
@@ -428,16 +435,43 @@ struct behavior_state
     std::vector<std::string> bannedV6Cache;
 
     // Network IP-set rules (subscribed CIDRs, e.g. PBH-BTN/BTN-Collected-Rules).
-    // The default (empty) snapshot is populated from the local cache at startup,
-    // then the background refresh swaps in a fresh snapshot on success. Peers
-    // whose address falls inside any range are banned.
-    // Thread safety (lock-free via atomic shared_ptr): the Net download callback
-    // runs on a worker thread and stores a brand-new snapshot; the libtorrent
-    // thread concurrently loads it in isBanned. A release store republishes the
-    // fully-parsed snapshot and an acquire load reads a consistent one; the
-    // loaded shared_ptr keeps the snapshot alive while isBanned walks its trie,
-    // so a replace that drops the last other reference frees it only afterwards.
-    std::atomic<std::shared_ptr<subscription_data>> subscription = std::make_shared<subscription_data>();
+    // Published as a single immutable snapshot. The only writer is the app thread
+    // (the Net::DownloadManager result callback) which swaps in a fully built
+    // snapshot with an atomic pointer store; the libtorrent network thread reads
+    // it in isBanned with a single acquire load and walks the returned raw
+    // pointer lock- and refcount-free, because a snapshot is never freed while
+    // any reader might still touch it.
+    //
+    // Reclamation: the writer retires the just-replaced snapshot to
+    // m_retiredSnapshots instead of deleting it; every snapshot object (retired
+    // and current) is freed only in ~behavior_state, which runs on the app
+    // thread after the libtorrent network thread is already down. The snapshot's
+    // contents (tries / persistence mirrors) are immutable and only written
+    // before publication on the writer thread, so readers never race the
+    // writer's data - only the publish itself, which is a single atomic pointer
+    // store. This is genuinely lock-free: a plain pointer, no spinlock and no
+    // refcount on the hot isBanned path (unlike atomic<shared_ptr>).
+    //
+    // Behavior note: because the fetch is now asynchronous, the subscription may
+    // be empty for the first moments after startup (no local cache yet, refresh
+    // still in flight), so IP-set bans are not enforced until the first refresh
+    // succeeds. This is the intended trade-off for a non-blocking startup; the
+    // cache-loaded snapshot (or an empty one) is used in the meantime.
+    std::atomic<subscription_data *> subscription = new subscription_data();
+
+    // Snapshots replaced by a newer refresh, kept alive for the whole process
+    // and freed in the destructor so they are never freed on a thread that could
+    // still be walking them. Written only on the app thread; the network thread
+    // never touches this vector.
+    std::vector<subscription_data *> m_retiredSnapshots;
+
+    ~behavior_state()
+    {
+        for (subscription_data *snap : m_retiredSnapshots)
+            delete snap;
+        m_retiredSnapshots.clear();
+        delete subscription.load(std::memory_order_acquire);
+    }
 };
 
 // ---- peer plugin ------------------------------------------------
@@ -554,13 +588,13 @@ private:
                     || m_state->bannedSubnet30.count(ident.subnet30)
                     || m_state->bannedSubnet24.count(ident.subnet24))
                 return true;
-            const std::shared_ptr<subscription_data> sub = m_state->subscription.load(std::memory_order_acquire);
-            return sub->trieV4.contains(v4HostToBytes(ident.host));
+            const subscription_data *sub = m_state->subscription.load(std::memory_order_acquire);
+            return sub && sub->trieV4.contains(v4HostToBytes(ident.host));
         }
         if (m_state->bannedSubnet60.count(ident.v6prefix))
             return true;
-        const std::shared_ptr<subscription_data> sub = m_state->subscription.load(std::memory_order_acquire);
-        return sub->trieV6.contains(ident.v6bytes);
+        const subscription_data *sub = m_state->subscription.load(std::memory_order_acquire);
+        return sub && sub->trieV6.contains(ident.v6bytes);
     }
 
     void runDetections(const lt::peer_info &info, const peer_identity &ident)
@@ -858,11 +892,12 @@ private:
 
         QTextStream ts(&in);
 
-        // This runs in the constructor, before the torrent/network thread
-        // exists and before the background refresh can store anything, so it
-        // is safe to mutate the single (shared) default snapshot directly. The
-        // refresh later replaces it wholesale via an atomic store.
-        const std::shared_ptr<subscription_data> sub = m_state->subscription.load();
+        // The constructor is the only mutator of the (shared) default snapshot:
+        // it runs before the torrent/network thread exists and before the
+        // background refresh can store anything, so filling the snapshot's
+        // tries/mirrors here is safe. The refresh later replaces it wholesale
+        // via an atomic pointer store.
+        subscription_data *sub = m_state->subscription.load();
         while (!ts.atEnd())
         {
             const QStringList parts = ts.readLine().split(QLatin1Char(' '));
@@ -944,7 +979,7 @@ private:
         for (const std::string &addr : m_state->bannedV6Cache)
             ts << QStringLiteral("v6 ") << QString::fromStdString(addr) << '\n';
 
-        const std::shared_ptr<subscription_data> sub = m_state->subscription.load(std::memory_order_acquire);
+        const subscription_data *sub = m_state->subscription.load(std::memory_order_acquire);
         for (const subnet_v4 &s : sub->v4)
             ts << QStringLiteral("c4 ") << formatIPv4(s.net) << QLatin1Char('/') << s.prefix << '\n';
         for (const subnet_v6 &s : sub->v6)
@@ -961,8 +996,10 @@ private:
     // monitor is torn down while a download is still in flight) and captures
     // m_state by value, so the shared state is kept alive regardless of this
     // monitor's lifetime. It parses into a fresh snapshot, applies the
-    // empty-result guard, and only then publishes it via an atomic release
-    // store that the libtorrent thread reads with an acquire load.
+    // empty-result guard, and only then publishes it via an atomic pointer
+    // exchange that the libtorrent thread reads with an acquire load. The
+    // replaced snapshot is retired (kept alive) rather than freed, so a reader
+    // still walking it never races a deletion; reclamation happens at shutdown.
     void fetchSubscription()
     {
         Net::DownloadManager *const mgr = Net::DownloadManager::instance();
@@ -983,19 +1020,24 @@ private:
                     return;
                 }
 
-                auto fresh = std::make_shared<subscription_data>();
+                auto fresh = std::make_unique<subscription_data>();
                 const std::size_t parsed = parseSubscriptionBody(res.data, *fresh);
 
                 if (parsed >= kMinSubscriptionRules)
                 {
-                    state->subscription.store(fresh, std::memory_order_release);
+                    const std::size_t v4Count = fresh->v4.size();
+                    const std::size_t v6Count = fresh->v6.size();
+                    subscription_data *old = state->subscription.exchange(fresh.release(), std::memory_order_acq_rel);
+                    if (old)
+                        state->m_retiredSnapshots.push_back(old);
                     LogMsg(QStringLiteral("BehaviorAntiLeech: subscription refresh applied (%1 v4, %2 v6 CIDRs)")
-                               .arg(fresh->v4.size()).arg(fresh->v6.size()));
+                               .arg(v4Count).arg(v6Count));
                 }
                 else
                 {
                     // Malformed/truncated body (e.g. a rate-limit or captive
-                    // page): keep the last known-good cache.
+                    // page): keep the last known-good cache. `fresh` is
+                    // reclaimed by the unique_ptr on this path.
                     LogMsg(QStringLiteral("BehaviorAntiLeech: subscription refresh rejected (%1 rules < %2), keeping cached rules")
                                .arg(parsed).arg(kMinSubscriptionRules));
                 }
