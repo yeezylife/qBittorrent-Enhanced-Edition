@@ -132,7 +132,10 @@ constexpr std::size_t kMinSubscriptionRules = 50;
 
 // FNV-1a 64-bit one-way hash. Used *only* to tell distinct IPv6 addresses
 // apart for counting; not used as a ban identity.
-inline std::uint64_t fnv1a64(const unsigned char *p, std::size_t n)
+// NOTE: no `inline` here on purpose: this header lives in an anonymous
+// namespace (internal linkage), so `inline` would be redundant with siblings
+// like formatIPv4/v4Mask below.
+std::uint64_t fnv1a64(const unsigned char *p, std::size_t n)
 {
     std::uint64_t h = kFNV1aOffset;
     for (std::size_t i = 0; i < n; ++i)
@@ -145,7 +148,7 @@ inline std::uint64_t fnv1a64(const unsigned char *p, std::size_t n)
 
 // Steady monotonic clock in milliseconds. Only used for the confirmation
 // window (no wall-time / timezone handling needed).
-inline std::int64_t nowMs()
+std::int64_t nowMs()
 {
     using namespace std::chrono;
     return time_point_cast<milliseconds>(steady_clock::now()).time_since_epoch().count();
@@ -173,7 +176,7 @@ struct peer_identity
     std::uint64_t groupKey() const { return v4 ? host : v6mult; }
 };
 
-inline peer_identity classify_peer(const lt::address &addr)
+peer_identity classify_peer(const lt::address &addr)
 {
     peer_identity out;
     if (addr.is_v4())
@@ -482,8 +485,11 @@ struct behavior_state
     // sequential (peer_behavior_monitor::m_nextId++), so a vector replaces the
     // three torrent-keyed hash maps: every per-tick access drops from two
     // nested hashes (outer torrentId + inner key) to one bounds check plus a
-    // pointer add, with far better locality for torrents with many peers.
-    std::vector<per_torrent_state> torrents;
+    // pointer dereference, with far better locality for torrents with many peers.
+    // Each slot is heap-allocated: a vector reallocation only moves the owning
+    // unique_ptrs, never the state itself, so a cached peer_track * stays valid
+    // by construction (no reliance on unordered_map move semantics).
+    std::vector<std::unique_ptr<per_torrent_state>> torrents;
 
     // global ban lists
     std::unordered_set<std::uint64_t> bannedExact;      // v4 exact host (progress/behaviour bans)
@@ -528,23 +534,26 @@ struct behavior_state
     }
 
     // Get-or-create on the network thread (the only thread that touches
-    // `torrents`). Growth is monotonic, and the node-based inner maps keep a
-    // cached peer_track * stable across a reallocation.
+    // `torrents`). Growth is monotonic; a slot is materialised on first use,
+    // and later reallocations never move the heap state behind a cached pointer.
     per_torrent_state &torrentState(std::uint32_t id)
     {
         if (id >= torrents.size())
             torrents.resize(static_cast<std::size_t>(id) + 1);
-        return torrents[id];
+        auto &slot = torrents[id];
+        if (!slot)
+            slot = std::make_unique<per_torrent_state>();
+        return *slot;
     }
 
     per_torrent_state *findTorrent(std::uint32_t id) noexcept
     {
-        return (id < torrents.size()) ? &torrents[id] : nullptr;
+        return ((id < torrents.size()) && torrents[id]) ? torrents[id].get() : nullptr;
     }
 
     const per_torrent_state *findTorrent(std::uint32_t id) const noexcept
     {
-        return (id < torrents.size()) ? &torrents[id] : nullptr;
+        return ((id < torrents.size()) && torrents[id]) ? torrents[id].get() : nullptr;
     }
 
     std::atomic<subscription_data *> subscription = new subscription_data();
@@ -594,13 +603,19 @@ struct torrent_context
         size = tf->total_size();
         // Precompute everything the per-tick path derives from `size`, once:
         // the reciprocal turns the per-tick progress division into a multiply,
-        // `allowedExcess` folds the max()+threshold math of the excess check,
-        // and `enforce` folds the sizeKnown/disabled/minimum-size gates so the
-        // hot path is a single boolean test.
+        // `allowedExcess` folds the max()+threshold math of the excess check.
+        // Two gates: `enforce` (sizeKnown && !disabled) lets a torrent take part
+        // in membership + self-ban enforcement, including small torrents whose
+        // subscription/multi-dial bans must still apply; `detect` adds the
+        // minimum-size gate and only guards the PCB progress math in
+        // runDetections(). Splitting them preserves the pre-optimization
+        // behavior where small torrents skipped detections but still enforced
+        // bans.
         invSize = (size > 0) ? (1.0 / static_cast<double>(size)) : 0.0;
         allowedExcess = static_cast<std::int64_t>(
             static_cast<double>(std::max(size, kMinTorrentSizeBytes)) * kExcessiveThreshold);
-        enforce = !disabled && (size >= kMinTorrentSizeBytes);
+        enforce = !disabled;
+        detect = enforce && (size >= kMinTorrentSizeBytes);
         sizeKnown = true;
         handle = {};                            // resolved: release the handle
     }
@@ -611,7 +626,8 @@ struct torrent_context
     double invSize = 0.0;             // 1.0 / size, for division-free progress
     bool sizeKnown = false;
     bool disabled = false;
-    bool enforce = false;             // sizeKnown && !disabled && size >= minimum
+    bool enforce = false;             // sizeKnown && !disabled: take part in enforcement
+    bool detect = false;              // enforce && size >= minimum: run PCB detections
 };
 
 // ---- peer plugin ------------------------------------------------
@@ -638,8 +654,9 @@ public:
         // if it never arrives - the whole plugin sleeps, so no ban, membership
         // or detection logic runs in any metadata window. A private magnet is
         // never policed, and a never-resolving magnet costs no per-peer work
-        // each second. `enforce` folds all of that plus the minimum-size gate
-        // into a single boolean test.
+        // each second. `enforce` folds the metadata/private gates into a single
+        // boolean test; small torrents stay enforced (membership + self-ban)
+        // and only skip the PCB progress math via `detect` in runDetections().
         if (!m_ctx->enforce)
             return;
 
@@ -799,8 +816,10 @@ private:
 
     void runDetections(const lt::peer_info &info, const peer_identity &ident)
     {
-        // Minimum-size / private / metadata gates are already folded into
-        // enforce by the caller; m_ctx->size is stable from here on.
+        // Small torrents (< kMinTorrentSizeBytes) skip the progress math but
+        // still take part in membership + self-ban enforcement in tick().
+        if (!m_ctx->detect)
+            return;
         const std::int64_t size = m_ctx->size;
 
         // PBH hands peers still in the handshake the "handshaking" pass; their
@@ -810,11 +829,17 @@ private:
 
         // The steady clock is only sampled when a suspicion threshold is
         // actually crossed: healthy peers (the common case) never pay for it.
+        // A dedicated sampled flag (not a now==0 sentinel) keeps single-sample
+        // semantics even if the clock ever reports 0.
         std::int64_t now = 0;
+        bool nowSampled = false;
         const auto nowLazy = [&]() -> std::int64_t
         {
-            if (now == 0)
+            if (!nowSampled)
+            {
                 now = nowMs();
+                nowSampled = true;
+            }
             return now;
         };
 
