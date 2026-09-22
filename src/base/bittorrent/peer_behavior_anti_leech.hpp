@@ -54,6 +54,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include <atomic>
 
@@ -131,7 +132,7 @@ constexpr std::size_t kMinSubscriptionRules = 50;
 
 // FNV-1a 64-bit one-way hash. Used *only* to tell distinct IPv6 addresses
 // apart for counting; not used as a ban identity.
-std::uint64_t fnv1a64(const unsigned char *p, std::size_t n)
+inline std::uint64_t fnv1a64(const unsigned char *p, std::size_t n)
 {
     std::uint64_t h = kFNV1aOffset;
     for (std::size_t i = 0; i < n; ++i)
@@ -144,7 +145,7 @@ std::uint64_t fnv1a64(const unsigned char *p, std::size_t n)
 
 // Steady monotonic clock in milliseconds. Only used for the confirmation
 // window (no wall-time / timezone handling needed).
-std::int64_t nowMs()
+inline std::int64_t nowMs()
 {
     using namespace std::chrono;
     return time_point_cast<milliseconds>(steady_clock::now()).time_since_epoch().count();
@@ -172,7 +173,7 @@ struct peer_identity
     std::uint64_t groupKey() const { return v4 ? host : v6mult; }
 };
 
-peer_identity classify_peer(const lt::address &addr)
+inline peer_identity classify_peer(const lt::address &addr)
 {
     peer_identity out;
     if (addr.is_v4())
@@ -331,7 +332,11 @@ public:
     // lookup caps at 32 and a v6 lookup stops at the deepest rule instead of
     // trailing the zeros of a stretched address. A /0 rule sets root.banned and
     // is matched by the first check regardless of depth.
-    bool contains(const v6bytes_t &addr, int bits) const
+    // Note: a /0 rule only sets root.banned and leaves m_maxDepth at 0, so
+    // emptiness must also test the root flag, not just the depth.
+    bool empty() const noexcept { return (m_maxDepth == 0) && !m_nodes.front().banned; }
+
+    bool contains(const v6bytes_t &addr, int bits) const noexcept
     {
         const trie_node *const base = m_nodes.data();
         const trie_node *n = base;   // index 0 is the root
@@ -456,17 +461,29 @@ struct peer_track
     std::int64_t suspectSinceMs = 0;
 };
 
+// Per-torrent detection state. Lives in behavior_state::torrents, indexed
+// directly by torrentId (see below).
+struct per_torrent_state
+{
+    // PCB tracking: ip-group -> track
+    std::unordered_map<std::uint64_t, peer_track> track;
+
+    // multi-dial membership: subnet -> (ip identity -> live conn count)
+    std::unordered_map<std::uint32_t, std::unordered_map<std::uint32_t, int>> subnetsV4;
+    std::unordered_map<std::uint64_t, std::unordered_map<std::uint64_t, int>> subnetsV6;
+};
+
 // Shared, cross-torrent anti-leech state. Only ever modified by plugin
 // callbacks, all of which run on the single libtorrent network thread, so no
 // locking is required.
 struct behavior_state
 {
-    // PCB tracking: torrentId -> ip-group -> track
-    std::unordered_map<std::uint32_t, std::unordered_map<std::uint64_t, peer_track>> track;
-
-    // multi-dial membership: torrentId -> subnet -> (ip identity -> live conn count)
-    std::unordered_map<std::uint32_t, std::unordered_map<std::uint32_t, std::unordered_map<std::uint32_t, int>>> subnetsV4;
-    std::unordered_map<std::uint32_t, std::unordered_map<std::uint64_t, std::unordered_map<std::uint64_t, int>>> subnetsV6;
+    // Per-torrent state indexed directly by torrentId. Ids are dense and
+    // sequential (peer_behavior_monitor::m_nextId++), so a vector replaces the
+    // three torrent-keyed hash maps: every per-tick access drops from two
+    // nested hashes (outer torrentId + inner key) to one bounds check plus a
+    // pointer add, with far better locality for torrents with many peers.
+    std::vector<per_torrent_state> torrents;
 
     // global ban lists
     std::unordered_set<std::uint64_t> bannedExact;      // v4 exact host (progress/behaviour bans)
@@ -498,6 +515,38 @@ struct behavior_state
     // still in flight), so IP-set bans are not enforced until the first refresh
     // succeeds. This is the intended trade-off for a non-blocking startup; the
     // cache-loaded snapshot (or an empty one) is used in the meantime.
+    behavior_state()
+    {
+        // Size the tables once so steady-state operation never pays a rehash:
+        // the ban lists only grow, and a few hundred torrents is the norm.
+        torrents.reserve(128);
+        bannedExact.reserve(2048);
+        bannedSubnet30.reserve(1024);
+        bannedSubnet24.reserve(256);
+        bannedSubnet48.reserve(1024);
+        bannedSubnet56.reserve(256);
+    }
+
+    // Get-or-create on the network thread (the only thread that touches
+    // `torrents`). Growth is monotonic, and the node-based inner maps keep a
+    // cached peer_track * stable across a reallocation.
+    per_torrent_state &torrentState(std::uint32_t id)
+    {
+        if (id >= torrents.size())
+            torrents.resize(static_cast<std::size_t>(id) + 1);
+        return torrents[id];
+    }
+
+    per_torrent_state *findTorrent(std::uint32_t id) noexcept
+    {
+        return (id < torrents.size()) ? &torrents[id] : nullptr;
+    }
+
+    const per_torrent_state *findTorrent(std::uint32_t id) const noexcept
+    {
+        return (id < torrents.size()) ? &torrents[id] : nullptr;
+    }
+
     std::atomic<subscription_data *> subscription = new subscription_data();
 
     // Snapshots replaced by a newer refresh, kept alive for the whole process
@@ -543,14 +592,26 @@ struct torrent_context
             return;
         disabled = tf->priv();                  // never police private trackers
         size = tf->total_size();
+        // Precompute everything the per-tick path derives from `size`, once:
+        // the reciprocal turns the per-tick progress division into a multiply,
+        // `allowedExcess` folds the max()+threshold math of the excess check,
+        // and `enforce` folds the sizeKnown/disabled/minimum-size gates so the
+        // hot path is a single boolean test.
+        invSize = (size > 0) ? (1.0 / static_cast<double>(size)) : 0.0;
+        allowedExcess = static_cast<std::int64_t>(
+            static_cast<double>(std::max(size, kMinTorrentSizeBytes)) * kExcessiveThreshold);
+        enforce = !disabled && (size >= kMinTorrentSizeBytes);
         sizeKnown = true;
         handle = {};                            // resolved: release the handle
     }
 
     lt::torrent_handle handle;
     std::int64_t size = 0;
+    std::int64_t allowedExcess = 0;   // size-derived excess-download ceiling
+    double invSize = 0.0;             // 1.0 / size, for division-free progress
     bool sizeKnown = false;
     bool disabled = false;
+    bool enforce = false;             // sizeKnown && !disabled && size >= minimum
 };
 
 // ---- peer plugin ------------------------------------------------
@@ -568,18 +629,37 @@ public:
 
     void tick() override
     {
-        if (!m_state || !m_attached)
+        if (!m_attached || !m_state || m_ignored)
             return;
 
         // Metadata resolution belongs to the torrent plugin (its tick(), with
         // new_connection() as an immediate fallback); this peer only reads the
-        // shared m_ctx. While a magnet's metadata is still pending (sizeKnown
-        // false) - or forever if it never arrives - the whole plugin sleeps, so
-        // no ban, membership or detection logic runs in any metadata window. A
-        // private magnet is never policed, and a never-resolving magnet costs no
-        // per-peer work each second.
-        if (!m_ctx->sizeKnown || m_ctx->disabled)
+        // shared m_ctx. While a magnet's metadata is still pending - or forever
+        // if it never arrives - the whole plugin sleeps, so no ban, membership
+        // or detection logic runs in any metadata window. A private magnet is
+        // never policed, and a never-resolving magnet costs no per-peer work
+        // each second. `enforce` folds all of that plus the minimum-size gate
+        // into a single boolean test.
+        if (!m_ctx->enforce)
             return;
+
+        // Steady state (the overwhelmingly common path): the address was
+        // classified once at connect time and cannot change on a live link, so
+        // the self-ban check needs no peer_info at all. A peer banned by
+        // somebody else's multi-dial/PCB decision disconnects here without
+        // paying for a get_peer_info it would never use.
+        if (m_registered)
+        {
+            if (isBanned(m_identity))
+            {
+                disconnectNow();
+                return;
+            }
+            lt::peer_info info;
+            m_peer.get_peer_info(info);
+            runDetections(info, m_identity);
+            return;
+        }
 
         lt::peer_info info;
         m_peer.get_peer_info(info);
@@ -587,11 +667,12 @@ public:
         // Classify exactly once per connection: the address cannot change on a
         // live link, so reclassifying (and re-hashing a v6 address) every tick
         // would be pure waste. registerMembership is idempotent.
-        if (!m_registered)
-            m_identity = classify_peer(info.ip.address());
-        const peer_identity &ident = m_identity;
+        const peer_identity ident = classify_peer(info.ip.address());
         if (!ident.ok)
-            return; // I2P / non-IP connection, ignore
+        {
+            m_ignored = true; // I2P / non-IP connection, ignore (address is immutable)
+            return;
+        }
 
         registerMembership(ident);
 
@@ -606,35 +687,52 @@ public:
 
     void on_disconnect(const boost::system::error_code &) override
     {
-        if (m_state && m_registered)
+        if (!m_state || !m_registered)
+            return;
+        // find() only: disconnecting must never re-create maps that were
+        // pruned after their last member left, otherwise the tables would grow
+        // without bound over a long session. Drained subnet maps are pruned so
+        // future lookups stay small; both are observably identical to keeping
+        // empty maps around.
+        if (per_torrent_state *tor = m_state->findTorrent(m_torrentId))
         {
             if (m_identity.v4)
             {
-                auto &subnetMap = m_state->subnetsV4[m_torrentId][m_identity.subnet24];
-                auto it = subnetMap.find(m_identity.host);
-                if (it != subnetMap.end())
+                const auto sit = tor->subnetsV4.find(m_identity.subnet24);
+                if (sit != tor->subnetsV4.end())
                 {
-                    if (it->second <= 1)
-                        subnetMap.erase(it);
-                    else
-                        --it->second;
+                    auto it = sit->second.find(m_identity.host);
+                    if (it != sit->second.end())
+                    {
+                        if (it->second <= 1)
+                            sit->second.erase(it);
+                        else
+                            --it->second;
+                    }
+                    if (sit->second.empty())
+                        tor->subnetsV4.erase(sit);
                 }
             }
             else
             {
-                auto &subnetMap = m_state->subnetsV6[m_torrentId][m_identity.v6mult];
-                auto it = subnetMap.find(m_identity.v6id);
-                if (it != subnetMap.end())
+                const auto sit = tor->subnetsV6.find(m_identity.v6mult);
+                if (sit != tor->subnetsV6.end())
                 {
-                    if (it->second <= 1)
-                        subnetMap.erase(it);
-                    else
-                        --it->second;
+                    auto it = sit->second.find(m_identity.v6id);
+                    if (it != sit->second.end())
+                    {
+                        if (it->second <= 1)
+                            sit->second.erase(it);
+                        else
+                            --it->second;
+                    }
+                    if (sit->second.empty())
+                        tor->subnetsV6.erase(sit);
                 }
             }
-            m_registered = false;
-            m_attached = false;
         }
+        m_registered = false;
+        m_attached = false;
     }
 
 private:
@@ -644,31 +742,27 @@ private:
             return;
 
         m_identity = ident;
-        if (ident.v4)
-            ++m_state->subnetsV4[m_torrentId][ident.subnet24][ident.host];
-        else
-            ++m_state->subnetsV6[m_torrentId][ident.v6mult][ident.v6id];
         m_registered = true;
 
-        // A subnet's membership only changes at connect/disconnect, so checking
-        // exactly once - right after incrementing - is equivalent to checking on
-        // every tick but costs one nested-map read instead of several per second.
-        updateMultiDial(ident);
-    }
-
-    // Multi-dial blocking: if too many distinct IPs of one subnet are attached
-    // to the same torrent, nuke the whole subnet.
-    void updateMultiDial(const peer_identity &ident)
-    {
+        // A subnet's membership only changes at connect/disconnect, so the
+        // multi-dial check runs exactly once - right after incrementing - which
+        // is equivalent to checking on every tick but costs one map probe per
+        // connection instead of several per second. The increment and the
+        // distinct-IP size check share a single lookup of the subnet map.
+        // Multi-dial blocking: too many distinct IPs of one subnet attached to
+        // the same torrent means one user hogging connections -> nuke it.
+        per_torrent_state &tor = m_state->torrentState(m_torrentId);
         if (ident.v4)
         {
-            const auto &subnetMap = m_state->subnetsV4[m_torrentId][ident.subnet24];
+            auto &subnetMap = tor.subnetsV4[ident.subnet24];
+            ++subnetMap[ident.host];
             if (subnetMap.size() > kTolerateV4)
                 banSubnetV4(ident.subnet24);
         }
         else
         {
-            const auto &subnetMap = m_state->subnetsV6[m_torrentId][ident.v6mult];
+            auto &subnetMap = tor.subnetsV6[ident.v6mult];
+            ++subnetMap[ident.v6id];
             if (subnetMap.size() > kTolerateV6)
                 banSubnetV6(ident.v6mult);
         }
@@ -677,11 +771,11 @@ private:
     // Stable per-connection anchor into the cross-reconnect PCB tracking map.
     // The (torrentId, ip-group) pair never changes for this plugin and nothing
     // ever erases from `track`, so resolve the entry once and reuse the pointer
-    // on every tick instead of re-hashing the two-level map each time.
+    // on every tick instead of probing the map each time.
     peer_track &tracked(const peer_identity &ident)
     {
         if (!m_trk)
-            m_trk = &m_state->track[m_torrentId][ident.groupKey()];
+            m_trk = &m_state->torrentState(m_torrentId).track[ident.groupKey()];
         return *m_trk;
     }
 
@@ -694,27 +788,36 @@ private:
                     || m_state->bannedSubnet24.count(ident.subnet24))
                 return true;
             const subscription_data *sub = m_state->subscription.load(std::memory_order_acquire);
-            return sub && sub->trieV4.contains(ident.bytes, 32);  // v4 prefixes are at most /32
+            return sub && !sub->trieV4.empty() && sub->trieV4.contains(ident.bytes, 32);  // v4 prefixes are at most /32
         }
         if (m_state->bannedSubnet56.count(ident.v6mult)
             || m_state->bannedSubnet48.count(ident.v6arb))
             return true;
         const subscription_data *sub = m_state->subscription.load(std::memory_order_acquire);
-        return sub && sub->trieV6.contains(ident.bytes, 128);
+        return sub && !sub->trieV6.empty() && sub->trieV6.contains(ident.bytes, 128);
     }
 
     void runDetections(const lt::peer_info &info, const peer_identity &ident)
     {
+        // Minimum-size / private / metadata gates are already folded into
+        // enforce by the caller; m_ctx->size is stable from here on.
         const std::int64_t size = m_ctx->size;
-        if (size < kMinTorrentSizeBytes)
-            return;
 
         // PBH hands peers still in the handshake the "handshaking" pass; their
         // reported progress (0) is not yet trustworthy.
         if (info.flags & lt::peer_info::handshake)
             return;
 
-        const std::int64_t now = nowMs();
+        // The steady clock is only sampled when a suspicion threshold is
+        // actually crossed: healthy peers (the common case) never pay for it.
+        std::int64_t now = 0;
+        const auto nowLazy = [&]() -> std::int64_t
+        {
+            if (now == 0)
+                now = nowMs();
+            return now;
+        };
+
         const float progress = std::clamp(info.progress, 0.0f, 1.0f);
         peer_track &trk = tracked(ident);
 
@@ -742,24 +845,22 @@ private:
             trk.lastReportProgress = progress;
 
         // ---- (1) Excess download (PBH excessiveClient) -----------------------
-        // Uses the cumulative upload count, and floors the allowed excess at
-        // max(torrentSize, minimumSize) exactly like PBH.
-        if (trk.statusUploaded > size)
+        // Uses the cumulative upload count against the precomputed ceiling
+        // (floored at max(torrentSize, minimumSize) x threshold, exactly like
+        // PBH): a single integer compare on this path.
+        if ((trk.statusUploaded > size) && (trk.statusUploaded > m_ctx->allowedExcess))
         {
-            const std::int64_t allowed = static_cast<std::int64_t>(
-                static_cast<double>(std::max(size, kMinTorrentSizeBytes)) * kExcessiveThreshold);
-            if (trk.statusUploaded > allowed)
-            {
-                clearSuspicion(trk);
-                banExact(ident, "Excess download");
-                return;
-            }
+            clearSuspicion(trk);
+            banExact(ident, "Excess download");
+            return;
         }
 
         if (!uploading)          // PBH early pass: no uploads -> no progress judgement
             return;
 
-        const double computedProgress = static_cast<double>(trk.statusUploaded) / static_cast<double>(size);
+        // Reciprocal multiply instead of a division: identical within a unit in
+        // the last place, far below the 2% suspicion threshold.
+        const double computedProgress = static_cast<double>(trk.statusUploaded) * m_ctx->invSize;
 
         // ---- (2) Under-reported progress (PBH differenceTest) ---------------
         // Only possible when our computed share exceeds the progress it reports.
@@ -770,7 +871,7 @@ private:
         {
             if ((computedProgress - progress) > kMaxProgressDiff)
             {
-                if (confirmSuspicion(trk, now))
+                if (confirmSuspicion(trk, nowLazy()))
                 {
                     clearSuspicion(trk);
                     banExact(ident, "Progress fraud");
@@ -801,7 +902,7 @@ private:
             const double rewind = static_cast<double>(lastReported) - progress;
             if (rewind > kRewindMaxDiff)
             {
-                if ((progress > 0.0f) || confirmSuspicion(trk, now))
+                if ((progress > 0.0f) || confirmSuspicion(trk, nowLazy()))
                 {
                     clearSuspicion(trk);
                     banExact(ident, "Progress rewind");
@@ -834,20 +935,15 @@ private:
         bool newlyBanned = false;
         if (ident.v4)
         {
-            newlyBanned = !m_state->bannedExact.count(ident.host);
-            m_state->bannedExact.insert(ident.host);
+            // Single-probe insert: the return flag replaces count()+insert().
+            newlyBanned = m_state->bannedExact.insert(ident.host).second;
             // auto range-ban: also cover the neighbouring /30 (v4)
-            if (!m_state->bannedSubnet30.count(ident.subnet30))
-            {
-                m_state->bannedSubnet30.insert(ident.subnet30);
-                newlyBanned = true;
-            }
+            newlyBanned = m_state->bannedSubnet30.insert(ident.subnet30).second || newlyBanned;
         }
         else
         {
             // auto range-ban: also cover the neighbouring /48 (v6)
-            newlyBanned = !m_state->bannedSubnet48.count(ident.v6arb);
-            m_state->bannedSubnet48.insert(ident.v6arb);
+            newlyBanned = m_state->bannedSubnet48.insert(ident.v6arb).second;
         }
 
         if (newlyBanned)
@@ -864,15 +960,22 @@ private:
 
     void banSubnetV4(std::uint32_t subnet24)
     {
-        if (m_state->bannedSubnet24.count(subnet24))
+        if (!m_state->bannedSubnet24.insert(subnet24).second)
             return;
 
-        m_state->bannedSubnet24.insert(subnet24);
-        const auto &peers = m_state->subnetsV4[m_torrentId][subnet24];
-        for (const auto &kv : peers)
+        // find() only: the subnet map is guaranteed present (we are registered
+        // in it), and a lookup must never re-create a pruned entry.
+        if (const per_torrent_state *tor = m_state->findTorrent(m_torrentId))
         {
-            m_state->bannedExact.insert(kv.first);
-            m_state->bannedSubnet30.insert(kv.first & 0xFFFFFFFCu);
+            const auto sit = tor->subnetsV4.find(subnet24);
+            if (sit != tor->subnetsV4.end())
+            {
+                for (const auto &kv : sit->second)
+                {
+                    m_state->bannedExact.insert(kv.first);
+                    m_state->bannedSubnet30.insert(kv.first & 0xFFFFFFFCu);
+                }
+            }
         }
 
         char subnetText[16];
@@ -889,10 +992,8 @@ private:
 
     void banSubnetV6(std::uint64_t subnet56)
     {
-        if (m_state->bannedSubnet56.count(subnet56))
+        if (!m_state->bannedSubnet56.insert(subnet56).second)
             return;
-
-        m_state->bannedSubnet56.insert(subnet56);
 
         LogMsg(u"行为反吸血: 多拨封禁 整个 /%1 网段 (IP: %2)"_s
                    .arg(kSubnetV6)
@@ -916,6 +1017,7 @@ private:
     peer_track *m_trk = nullptr;     // cached PCB-track slot for this connection
     bool m_hasPrevTotal = false;     // whether m_lastUpload is meaningful yet
     bool m_registered = false;
+    bool m_ignored = false;          // non-IP (I2P) connection, classified once
     bool m_attached = true;
 };
 
