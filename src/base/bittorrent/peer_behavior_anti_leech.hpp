@@ -461,7 +461,7 @@ struct peer_track
 
     // Steady-clock millisecond timestamp when the last progress-based suspicion
     // was first observed (PBH "ban-delay window"). 0 = no active suspicion.
-    std::int64_t suspectSinceMs = 0;
+    std::int64_t suspectSinceMs = 0; // 0 = 未武装；即便时钟采样恰为 0，也只会让窗口晚一拍，不会误封
 };
 
 // Per-torrent detection state. Lives in behavior_state::torrents, indexed
@@ -489,6 +489,12 @@ struct behavior_state
     // Each slot is heap-allocated: a vector reallocation only moves the owning
     // unique_ptrs, never the state itself, so a cached peer_track * stays valid
     // by construction (no reliance on unordered_map move semantics).
+    // Lifetime convention: ids are never recycled and slots are never erased
+    // or moved (id == index must hold, and live peer plugins may cache node
+    // pointers into a slot). A removed torrent's slot is simply left behind:
+    // an untouched slot costs one null pointer. Do not "reclaim" with
+    // erase/move; that would invalidate both the index mapping and cached
+    // peer_track * anchors.
     std::vector<std::unique_ptr<per_torrent_state>> torrents;
 
     // global ban lists
@@ -626,7 +632,7 @@ struct torrent_context
     double invSize = 0.0;             // 1.0 / size, for division-free progress
     bool sizeKnown = false;
     bool disabled = false;
-    bool enforce = false;             // sizeKnown && !disabled: take part in enforcement
+    bool enforce = false;             // == sizeKnown && !disabled (sizeKnown 于本函数末尾置位)
     bool detect = false;              // enforce && size >= minimum: run PCB detections
 };
 
@@ -672,6 +678,8 @@ public:
                 disconnectNow();
                 return;
             }
+            if (!m_ctx->detect)          // 小种子：已完成分类且无 PCB 检测需求，跳过 peer_info
+                return;
             lt::peer_info info;
             m_peer.get_peer_info(info);
             runDetections(info, m_identity);
