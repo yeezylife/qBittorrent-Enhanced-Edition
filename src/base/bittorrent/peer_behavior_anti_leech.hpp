@@ -1194,6 +1194,8 @@ private:
     //   s24  203.0.113.0   (banned /24, multi-dial)
     //   v6a  2001:db8::   (banned /48, auto range-ban; host bits already zeroed)
     //   v6m  2001:db8::   (banned /56, multi-dial; host bits already zeroed)
+    //   c4   192.0.2.0/24  (subscribed IPv4 CIDR; parts[1] is not a bare IP)
+    //   c6   2001:db8::/32 (subscribed IPv6 CIDR; parts[1] is not a bare IP)
     void loadBanCache()
     {
         const Path dir = specialFolderLocation(SpecialFolder::Data);
@@ -1218,6 +1220,22 @@ private:
             const QStringList parts = ts.readLine().split(QLatin1Char(' '));
             if ((parts.size() < 2) || parts[1].isEmpty())
                 continue;
+
+            // CIDR lines store "<network>/<prefix>" in parts[1], which
+            // lt::make_address() rejects. They must be dispatched before the
+            // bare-IP parse below: otherwise the exception path would `continue`
+            // and every cached subscription rule would be silently dropped.
+            if (parts[0] == QLatin1String("c4"))
+            {
+                addRule(*sub, parts[1], 1);      // v4 line: a v6 CIDR in it is ignored
+                continue;
+            }
+
+            if (parts[0] == QLatin1String("c6"))
+            {
+                addRule(*sub, parts[1], 2);      // v6 line: a v4 CIDR in it is ignored
+                continue;
+            }
 
             peer_identity ident;
             try
@@ -1250,10 +1268,6 @@ private:
                         m_state->bannedSubnet48.insert(ident.v6arb);
                 }
             }
-            else if (parts[0] == QLatin1String("c4"))
-                addRule(*sub, parts[1], 1);      // v4 line: a v6 CIDR in it is ignored
-            else if (parts[0] == QLatin1String("c6"))
-                addRule(*sub, parts[1], 2);      // v6 line: a v4 CIDR in it is ignored
         }
     }
 
