@@ -42,11 +42,12 @@
 // lazy, cache-only torrent_handle::torrent_file() used once to resolve a
 // magnet's size / private flag - both are safe to call on the network thread.
 //
-// The queueing decision thresholds below are intentionally *aggressive*
+// The ban decision thresholds below are intentionally *aggressive*
 // ("宁错杀不放过"): tune them down if you get too many false positives.
 
-#include <array>
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -55,8 +56,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
-#include <atomic>
 
 #include <boost/asio/error.hpp>
 
@@ -115,7 +114,7 @@ constexpr int kSubnetV4 = 24;
 constexpr int kSubnetV6 = 56;
 // Auto range-ban (PBH auto-range-ban ipv6) uses a coarser IPv6 /48 so a whole
 // residential prefix is covered and an attacker cannot hide by spreading IPs
-// across a handful of /56s. The /48 mask appears in classify_peer.
+// across a handful of /56s. Both masks are applied in classify_peer.
 // Distinct IPs of the same subnet connected to the same torrent that are
 // tolerated. Ban once the count is *above* these values.
 constexpr int kTolerateV4 = 1;
@@ -157,9 +156,36 @@ std::int64_t nowMs()
 // 128-bit IPv6 byte container (matches boost's address_v6::bytes_type).
 using v6bytes_t = std::array<unsigned char, 16>;
 
-// Per-IP address classification. v4 uses a plain 32-bit host; v6 uses a 56-bit
-// prefix for grouping (a home user is treated as one face) plus a full-address
-// hash to tell distinct addresses apart for the multi-dial counter.
+// IPv4 bytes <-> host-order integer, the two directions every path needs:
+// classify_peer()/parseCIDR() decode an address, while the trie and the ban
+// cache re-encode one.
+std::uint32_t v4ToHost(const lt::address_v4 &addr)
+{
+    const auto b = addr.to_bytes();
+    return (static_cast<std::uint32_t>(b[0]) << 24)
+         | (static_cast<std::uint32_t>(b[1]) << 16)
+         | (static_cast<std::uint32_t>(b[2]) << 8)
+         | static_cast<std::uint32_t>(b[3]);
+}
+
+// Stretch an IPv4 host (b[0] = most-significant octet) into the 128-bit byte
+// container the trie walks. Only the first 4 bytes are meaningful; the high bits
+// of a v4 rule are never walked.
+v6bytes_t v4HostToBytes(std::uint32_t host)
+{
+    v6bytes_t b {};
+    b[0] = static_cast<unsigned char>(host >> 24);
+    b[1] = static_cast<unsigned char>(host >> 16);
+    b[2] = static_cast<unsigned char>(host >> 8);
+    b[3] = static_cast<unsigned char>(host);
+    return b;
+}
+
+// Per-IP address classification. v4 keeps the full 32-bit host (/32 PCB
+// identity) plus its /24 and /30; v6 keeps the masked high 64-bit half as the
+// /56 PCB/multi-dial group, a /48 for the auto range-ban, a full-address hash to
+// tell distinct addresses apart for the multi-dial counter, and the raw bytes
+// for the trie.
 struct peer_identity
 {
     bool ok = false;
@@ -173,7 +199,11 @@ struct peer_identity
     std::uint64_t v6id = 0;        // IPv6 identity (hashed full address)
     v6bytes_t bytes {};            // raw address in the 128-bit trie container (stretched v4 / full v6)
 
-    std::uint64_t groupKey() const { return v4 ? host : v6mult; }
+    // Key of the cross-reconnect PCB tracking map. v4 hosts and v6 /56 prefixes
+    // share one 64-bit key space; the only way they can collide is an IPv6
+    // address whose high 64 bits are (nearly) zero (i.e. an IPv4-compatible
+    // ::/64 address), which is never the address of a real peer.
+    std::uint64_t groupKey() const noexcept { return v4 ? host : v6mult; }
 };
 
 peer_identity classify_peer(const lt::address &addr)
@@ -181,11 +211,13 @@ peer_identity classify_peer(const lt::address &addr)
     peer_identity out;
     if (addr.is_v4())
     {
-        const auto b = addr.to_v4().to_bytes();
-        const std::uint32_t host = (static_cast<std::uint32_t>(b[0]) << 24)
-                                 | (static_cast<std::uint32_t>(b[1]) << 16)
-                                 | (static_cast<std::uint32_t>(b[2]) << 8)
-                                 | static_cast<std::uint32_t>(b[3]);
+        const std::uint32_t host = v4ToHost(addr.to_v4());
+        // 0.0.0.0 is what libtorrent leaves in a peer_info that was never
+        // filled (e.g. the connection handle expired between tick() and
+        // get_peer_info()). It is never a real peer, so it must not enter
+        // membership accounting nor the ban cache.
+        if (host == 0)
+            return out;
         out.ok = true;
         out.v4 = true;
         out.host = host;
@@ -193,19 +225,19 @@ peer_identity classify_peer(const lt::address &addr)
         out.subnet24 = host & 0xFFFFFF00u;
         // Stretch into the 128-bit trie container exactly once so the hot
         // lookup path never rebuilds it on every tick.
-        out.bytes[0] = static_cast<unsigned char>(host >> 24);
-        out.bytes[1] = static_cast<unsigned char>(host >> 16);
-        out.bytes[2] = static_cast<unsigned char>(host >> 8);
-        out.bytes[3] = static_cast<unsigned char>(host);
+        out.bytes = v4HostToBytes(host);
     }
     else if (addr.is_v6())
     {
         const auto b = addr.to_v6().to_bytes();
-        out.ok = true;
-        out.v4 = false;
         std::uint64_t hi = 0;
         for (int i = 0; i < 8; ++i)
             hi = (hi << 8) | b[i];
+        // :: is the v6 counterpart of the 0.0.0.0 placeholder above.
+        if ((hi == 0) && std::all_of(b.begin() + 8, b.end(), [](unsigned char c) { return c == 0; }))
+            return out;
+        out.ok = true;
+        out.v4 = false;
         out.v6mult = hi & 0xFFFFFFFFFFFFFF00ULL;     // /56 (PCB identity + multi-dial subnet)
         out.v6arb = hi & 0xFFFFFFFFFFFF0000ULL;      // /48 (auto range-ban)
         out.v6id = fnv1a64(b.data(), 16);
@@ -262,19 +294,6 @@ v6bytes_t v6HiToBytes(std::uint64_t hi)
     v6bytes_t b {};
     for (int i = 0; i < 8; ++i)
         b[i] = static_cast<unsigned char>(hi >> (56 - 8 * i));
-    return b;
-}
-
-// Stretch an IPv4 host (b[0] is the most-significant octet, as produced by
-// classify_peer) into the 128-bit byte container used by the trie. Only the
-// first 4 bytes are meaningful; the high bits of a v4 rule are never walked.
-v6bytes_t v4HostToBytes(std::uint32_t host)
-{
-    v6bytes_t b {};
-    b[0] = static_cast<unsigned char>(host >> 24);
-    b[1] = static_cast<unsigned char>(host >> 16);
-    b[2] = static_cast<unsigned char>(host >> 8);
-    b[3] = static_cast<unsigned char>(host);
     return b;
 }
 
@@ -391,16 +410,20 @@ int parseCIDR(const QString &token, subnet_v4 &s4, subnet_v6 &s6)
         netPart = t.left(slash);
         // Parse the prefix digits in place, avoiding a temporary QString from
         // mid().toInt(); out-of-range values are clamped below regardless.
-        std::int64_t acc = 0;
+        // The accumulator is capped at 1000: any real prefix is <= 128 (clamped
+        // below anyway), and the cap keeps a garbage token such as ".../999...9"
+        // from overflowing it (signed overflow is UB) instead of merely parsing
+        // as "too big".
+        int acc = 0;
         bool valid = false;
         for (int i = slash + 1, n = t.size(); i < n; ++i)
         {
             const int d = t.at(i).digitValue();
             if (d < 0) { valid = false; break; }
-            acc = acc * 10 + d;
+            acc = std::min(1000, acc * 10 + d);
             valid = true;
         }
-        prefix = valid ? static_cast<int>(acc) : -1;
+        prefix = valid ? acc : -1;
     }
 
     lt::address addr;
@@ -424,7 +447,7 @@ int parseCIDR(const QString &token, subnet_v4 &s4, subnet_v6 &s6)
         // such an entry accidentally.
         s4.prefix = prefix;
         s4.mask = v4Mask(prefix);
-        s4.net = classify_peer(addr).host & s4.mask;
+        s4.net = v4ToHost(addr.to_v4()) & s4.mask;
         return 1;
     }
 
@@ -442,6 +465,32 @@ int parseCIDR(const QString &token, subnet_v4 &s4, subnet_v6 &s6)
     }
 
     return 0;
+}
+
+// Parse one CIDR token and append it to `sub`: the trie is the query structure
+// and the vector is the serialisation mirror, so both are always updated
+// together. `wantKind` restricts the accepted family (1 = IPv4, 2 = IPv6), 0
+// accepts either. Returns the family appended, or 0 when the token was skipped.
+// The single entry point keeps loadBanCache() and parseSubscriptionBody()
+// aligned - the cache used to carry two hand-copied variants of this code.
+int addRule(subscription_data &sub, const QString &token, int wantKind = 0)
+{
+    subnet_v4 s4;
+    subnet_v6 s6;
+    const int kind = parseCIDR(token, s4, s6);
+    if ((kind == 0) || ((wantKind != 0) && (kind != wantKind)))
+        return 0;
+    if (kind == 1)
+    {
+        sub.v4.push_back(s4);
+        sub.trieV4.insert(v4HostToBytes(s4.net), s4.prefix);
+    }
+    else
+    {
+        sub.v6.push_back(s6);
+        sub.trieV6.insert(s6.net, s6.prefix);
+    }
+    return kind;
 }
 
 // Per torrent + IP-group tracked facts (kept across reconnects so a cyclic
@@ -463,6 +512,43 @@ struct peer_track
     // was first observed (PBH "ban-delay window"). 0 = no active suspicion.
     std::int64_t suspectSinceMs = 0; // 0 = 未武装；即便时钟采样恰为 0，也只会让窗口晚一拍，不会误封
 };
+
+// Multi-dial membership helpers, shared by the v4 (/24 -> host) and v6
+// (/56 -> hashed address) counters. Both maps are keyed
+// subnet -> (identity -> live connection count).
+
+// Add one live connection to `subnet` and report whether the subnet now holds
+// *more* than `tolerance` distinct identities - i.e. the multi-dial signal.
+// Incrementing and counting share the single map probe the caller already needs.
+template <typename Key, typename Id>
+bool addMember(std::unordered_map<Key, std::unordered_map<Id, int>> &subnets
+               , const Key &subnet, const Id &id, int tolerance)
+{
+    auto &members = subnets[subnet];
+    ++members[id];
+    return members.size() > static_cast<std::size_t>(tolerance);
+}
+
+// Drop one live connection, pruning the entry once its last member left.
+// find() only: disconnecting must never re-create maps that were pruned after
+// their last member left, otherwise the tables would grow without bound over a
+// long session. A drained subnet map is pruned too, so future lookups stay small.
+template <typename Key, typename Id>
+void removeMember(std::unordered_map<Key, std::unordered_map<Id, int>> &subnets
+                  , const Key &subnet, const Id &id)
+{
+    const auto sit = subnets.find(subnet);
+    if (sit == subnets.end())
+        return;
+    const auto it = sit->second.find(id);
+    if (it != sit->second.end())
+    {
+        if (--it->second <= 0)
+            sit->second.erase(it);
+    }
+    if (sit->second.empty())
+        subnets.erase(sit);
+}
 
 // Per-torrent detection state. Lives in behavior_state::torrents, indexed
 // directly by torrentId (see below).
@@ -498,7 +584,7 @@ struct behavior_state
     std::vector<std::unique_ptr<per_torrent_state>> torrents;
 
     // global ban lists
-    std::unordered_set<std::uint64_t> bannedExact;      // v4 exact host (progress/behaviour bans)
+    std::unordered_set<std::uint32_t> bannedExact;      // v4 exact host (progress/behaviour bans)
     std::unordered_set<std::uint32_t> bannedSubnet30;   // v4 /30 (auto range-ban)
     std::unordered_set<std::uint32_t> bannedSubnet24;   // v4 /24 (multi-dial)
     std::unordered_set<std::uint64_t> bannedSubnet48;   // v6 /48 (auto range-ban)
@@ -695,7 +781,7 @@ public:
         const peer_identity ident = classify_peer(info.ip.address());
         if (!ident.ok)
         {
-            m_ignored = true; // I2P / non-IP connection, ignore (address is immutable)
+            m_ignored = true; // non-IP (I2P) or placeholder address, ignore (immutable)
             return;
         }
 
@@ -716,45 +802,15 @@ public:
             return;
         // find() only: disconnecting must never re-create maps that were
         // pruned after their last member left, otherwise the tables would grow
-        // without bound over a long session. Drained subnet maps are pruned so
-        // future lookups stay small; both are observably identical to keeping
-        // empty maps around.
-        if (per_torrent_state *tor = m_state->findTorrent(m_torrentId))
+        // without bound over a long session. removeMember() prunes both the
+        // drained ip entry and the drained subnet entry, which is observably
+        // identical to keeping empty maps around.
+        if (per_torrent_state *const tor = m_state->findTorrent(m_torrentId))
         {
             if (m_identity.v4)
-            {
-                const auto sit = tor->subnetsV4.find(m_identity.subnet24);
-                if (sit != tor->subnetsV4.end())
-                {
-                    auto it = sit->second.find(m_identity.host);
-                    if (it != sit->second.end())
-                    {
-                        if (it->second <= 1)
-                            sit->second.erase(it);
-                        else
-                            --it->second;
-                    }
-                    if (sit->second.empty())
-                        tor->subnetsV4.erase(sit);
-                }
-            }
+                removeMember(tor->subnetsV4, m_identity.subnet24, m_identity.host);
             else
-            {
-                const auto sit = tor->subnetsV6.find(m_identity.v6mult);
-                if (sit != tor->subnetsV6.end())
-                {
-                    auto it = sit->second.find(m_identity.v6id);
-                    if (it != sit->second.end())
-                    {
-                        if (it->second <= 1)
-                            sit->second.erase(it);
-                        else
-                            --it->second;
-                    }
-                    if (sit->second.empty())
-                        tor->subnetsV6.erase(sit);
-                }
-            }
+                removeMember(tor->subnetsV6, m_identity.v6mult, m_identity.v6id);
         }
         m_registered = false;
         m_attached = false;
@@ -779,17 +835,12 @@ private:
         per_torrent_state &tor = m_state->torrentState(m_torrentId);
         if (ident.v4)
         {
-            auto &subnetMap = tor.subnetsV4[ident.subnet24];
-            ++subnetMap[ident.host];
-            if (subnetMap.size() > kTolerateV4)
+            if (addMember(tor.subnetsV4, ident.subnet24, ident.host, kTolerateV4))
                 banSubnetV4(ident.subnet24);
         }
-        else
+        else if (addMember(tor.subnetsV6, ident.v6mult, ident.v6id, kTolerateV6))
         {
-            auto &subnetMap = tor.subnetsV6[ident.v6mult];
-            ++subnetMap[ident.v6id];
-            if (subnetMap.size() > kTolerateV6)
-                banSubnetV6(ident.v6mult);
+            banSubnetV6(ident.v6mult);
         }
     }
 
@@ -806,20 +857,30 @@ private:
 
     bool isBanned(const peer_identity &ident) const
     {
+        // Self-ban check: the peer disconnects itself, no session-wide API is
+        // touched (see the threading note at the top).
         if (ident.v4)
         {
             if (m_state->bannedExact.count(ident.host)
                     || m_state->bannedSubnet30.count(ident.subnet30)
                     || m_state->bannedSubnet24.count(ident.subnet24))
                 return true;
-            const subscription_data *sub = m_state->subscription.load(std::memory_order_acquire);
-            return sub && !sub->trieV4.empty() && sub->trieV4.contains(ident.bytes, 32);  // v4 prefixes are at most /32
         }
-        if (m_state->bannedSubnet56.count(ident.v6mult)
-            || m_state->bannedSubnet48.count(ident.v6arb))
+        else if (m_state->bannedSubnet56.count(ident.v6mult)
+                 || m_state->bannedSubnet48.count(ident.v6arb))
+        {
             return true;
-        const subscription_data *sub = m_state->subscription.load(std::memory_order_acquire);
-        return sub && !sub->trieV6.empty() && sub->trieV6.contains(ident.bytes, 128);
+        }
+
+        // Subscribed network IP-set rules: one acquire load of the immutable
+        // snapshot, then a trie walk bounded by the deepest inserted rule (a v4
+        // prefix is at most /32). An empty trie is answered by empty() without
+        // touching the arena.
+        const subscription_data *const sub = m_state->subscription.load(std::memory_order_acquire);
+        if (!sub)
+            return false;
+        const subnet_trie &trie = ident.v4 ? sub->trieV4 : sub->trieV6;
+        return !trie.empty() && trie.contains(ident.bytes, ident.v4 ? 32 : 128);
     }
 
     void runDetections(const lt::peer_info &info, const peer_identity &ident)
@@ -896,31 +957,22 @@ private:
         const double computedProgress = static_cast<double>(trk.statusUploaded) * m_ctx->invSize;
 
         // ---- (2) Under-reported progress (PBH differenceTest) ---------------
-        // Only possible when our computed share exceeds the progress it reports.
         // The confirmation window absorbs a brief transient (a fast peer's
         // reported progress catching up to our upload count) while a sustained
-        // under-report eventually exceeds the window and is banned.
-        if (computedProgress > progress)
+        // under-report eventually exceeds the window and is banned. The single
+        // comparison also covers "reported >= computed" (the difference is then
+        // <= 0, well below the positive threshold), which is the behaving case.
+        if ((computedProgress - progress) > kMaxProgressDiff)
         {
-            if ((computedProgress - progress) > kMaxProgressDiff)
-            {
-                if (confirmSuspicion(trk, nowLazy()))
-                {
-                    clearSuspicion(trk);
-                    banExact(ident, "Progress fraud");
-                    return;
-                }
-            }
-            else
+            if (confirmSuspicion(trk, nowLazy()))
             {
                 clearSuspicion(trk);
+                banExact(ident, "Progress fraud");
+                return;
             }
         }
         else
         {
-            // Reported >= computed: as far as the difference is concerned the
-            // peer is advancing normally. A rewind that also trips below is
-            // judged independently on the next block.
             clearSuspicion(trk);
         }
 
@@ -1011,13 +1063,9 @@ private:
             }
         }
 
-        char subnetText[16];
-        std::snprintf(subnetText, sizeof(subnetText), "%u.%u.%u.%u"
-                      , (subnet24 >> 24) & 0xFFu, (subnet24 >> 16) & 0xFFu, (subnet24 >> 8) & 0xFFu, subnet24 & 0xFFu);
-
         LogMsg(u"行为反吸血: 多拨封禁 整个 /%1 网段 (子网: %2/24)"_s
                    .arg(kSubnetV4)
-                   .arg(QString::fromLatin1(subnetText))
+                   .arg(formatIPv4(subnet24))
                , Log::WARNING);
 
         disconnectNow();
@@ -1036,8 +1084,16 @@ private:
         disconnectNow();
     }
 
+    // Ask libtorrent to drop the connection and park this plugin: the peer may
+    // survive a few more ticks, and those ticks must not repeat the ban lookup,
+    // the get_peer_info() call (libtorrent asserts on it once a connection is
+    // closing) and the disconnect request. Membership is still released by
+    // on_disconnect(), which keys off m_registered, not off this flag.
     void disconnectNow()
     {
+        if (!m_attached)   // already requested: the peer is on its way out
+            return;
+        m_attached = false;
         m_peer.disconnect(boost::asio::error::connection_refused, lt::operation_t::bittorrent, lt::disconnect_severity_t{0});
     }
 
@@ -1051,7 +1107,7 @@ private:
     bool m_hasPrevTotal = false;     // whether m_lastUpload is meaningful yet
     bool m_registered = false;
     bool m_ignored = false;          // non-IP (I2P) connection, classified once
-    bool m_attached = true;
+    bool m_attached = true;          // cleared once a disconnect has been requested
 };
 
 // ---- torrent plugin ---------------------------------------------
@@ -1195,25 +1251,9 @@ private:
                 }
             }
             else if (parts[0] == QLatin1String("c4"))
-            {
-                subnet_v4 s4;
-                subnet_v6 s6;
-                if (parseCIDR(parts[1], s4, s6) == 1)
-                {
-                    sub->v4.push_back(s4);
-                    sub->trieV4.insert(v4HostToBytes(s4.net), s4.prefix);
-                }
-            }
+                addRule(*sub, parts[1], 1);      // v4 line: a v6 CIDR in it is ignored
             else if (parts[0] == QLatin1String("c6"))
-            {
-                subnet_v4 s4;
-                subnet_v6 s6;
-                if (parseCIDR(parts[1], s4, s6) == 2)
-                {
-                    sub->v6.push_back(s6);
-                    sub->trieV6.insert(s6.net, s6.prefix);
-                }
-            }
+                addRule(*sub, parts[1], 2);      // v6 line: a v4 CIDR in it is ignored
         }
     }
 
@@ -1229,8 +1269,8 @@ private:
             return;
 
         QTextStream ts(&out);
-        for (const std::uint64_t host : m_state->bannedExact)
-            ts << QStringLiteral("v4 ") << formatIPv4(static_cast<std::uint32_t>(host & 0xFFFFFFFFu)) << '\n';
+        for (const std::uint32_t host : m_state->bannedExact)
+            ts << QStringLiteral("v4 ") << formatIPv4(host) << '\n';
         for (const std::uint32_t subnet : m_state->bannedSubnet30)
             ts << QStringLiteral("s30 ") << formatIPv4(subnet) << '\n';
         for (const std::uint32_t subnet : m_state->bannedSubnet24)
@@ -1339,22 +1379,8 @@ private:
                 --e;
             if (e > b && p[b] != '#')   // skip blanks and comment lines
             {
-                const QString line = QString::fromUtf8(p + b, e - b);
-                subnet_v4 s4;
-                subnet_v6 s6;
-                const int kind = parseCIDR(line, s4, s6);
-                if (kind == 1)
-                {
-                    out.v4.push_back(s4);
-                    out.trieV4.insert(v4HostToBytes(s4.net), s4.prefix);
+                if (addRule(out, QString::fromUtf8(p + b, e - b)) != 0)
                     ++parsed;
-                }
-                else if (kind == 2)
-                {
-                    out.v6.push_back(s6);
-                    out.trieV6.insert(s6.net, s6.prefix);
-                    ++parsed;
-                }
             }
             lineStart = eol + 1;
         }
